@@ -1,0 +1,145 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: dblpolicy-omni
+    description: Protects sensitive PII data based on customer's token status
+    category: Custom
+    metadata/interfaceScope: api,resource
+    metadata/capabilities/injectionPoint: outbound
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    dataBlindKey:
+      type: string
+      format: dataweave
+      description: Encryption Key used by the DataBlind
+      default: "#['1234567812345678']"
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    tweak:
+      type: string
+      format: dataweave
+      description: Payload Field to be used as Encryption Tweak
+      default: "#[payload.Id default '12345678']"
+      bindings:
+        payload:
+          mimeType: json
+        attributes: true
+    dataCryptService:
+      type: string
+      format: service
+      description: Base URI of the DataBlind DataCrypt REST service (hosts the encrypt/filter and AI redaction endpoints)
+      default: "https://kwoz0lfnn8.execute-api.us-west-1.amazonaws.com"
+    dataCryptApiKey:
+      type: string
+      description: API key sent as the x-api-key header when calling the DataBlind DataCrypt REST service
+      default: "Please contact mulesoftconnector@ztensor.com"
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    sensitiveFieldsSpecified:
+      type: boolean
+      description: If selected, then the sensitiveFields will be specified manually.
+      default: false
+    dataBlindApiUri:
+      type: string
+      description: URI for AI based redaction service
+      default: "https://kwoz0lfnn8.execute-api.us-west-1.amazonaws.com/Dev/datacrypt-nlp"
+      "@rendering":
+        "@visibleOn":
+          - property: sensitiveFieldsSpecified
+            value: false
+    dataBlindApiKey:
+      type: string
+      description: API Key for DataBlind AI Redaction API
+      default: "Please contact mulesoftconnector@ztensor.com"
+      "@context":
+        "@characteristics":
+          - security:sensitive
+      "@rendering":
+        "@visibleOn":
+          - property: sensitiveFieldsSpecified
+            value: false
+    proxyHost:
+      type: string
+      description: Proxy host for accessing DataBlind AI Redaction Service URI
+      default: "0001"
+      "@rendering":
+        "@visibleOn":
+          - property: sensitiveFieldsSpecified
+            value: false
+    proxyPort:
+      type: string
+      description: Proxy port for accessing DataBlind AI Redaction Service URI
+      default: "8080"
+      "@rendering":
+        "@visibleOn":
+          - property: sensitiveFieldsSpecified
+            value: false
+    proxyUsername:
+      type: string
+      format: dataweave
+      description: Proxy username for accessing DataBlind AI Redaction Service URI
+      default: "proxyusername"
+      "@rendering":
+        "@visibleOn":
+          - property: sensitiveFieldsSpecified
+            value: false
+    proxyPassword:
+      type: string
+      description: Proxy password for accessing DataBlind AI Redaction Service URI
+      default: "proxypassword"
+      "@context":
+        "@characteristics":
+          - security:sensitive
+      "@rendering":
+        "@visibleOn":
+          - property: sensitiveFieldsSpecified
+            value: false
+    sensitiveFieldsMultiLine:
+      type: array
+      items:
+        type: string
+      description: Multi Line Sensitive fields in the API response (use Add to add more entries)
+      default:
+        - '{ "Name" : "FE:PersonName", "TaxId" : "FE:SSN" }'
+      "@rendering":
+        "@visibleOn":
+          - property: sensitiveFieldsSpecified
+            value: true
+    eligibleHttpCodes:
+      type: string
+      format: dataweave
+      description: Apply Datablind only when the API response has the following HTTP Codes
+      default: "#['200,201,202,205,213']"
+    dataBlindToken:
+      type: string
+      format: dataweave
+      description: When a valid override token is provided, Datablind returns the unencrypted and unmasked data
+      default: "#[attributes.headers['dataBlindToken']]"
+    dataBlindPassphrase:
+      type: string
+      format: dataweave
+      description: When a valid override token passphrase is provided, Datablind returns the unencrypted and unmasked data
+      default: "#[attributes.headers['dataBlindPassphrase']]"
+    filterRule:
+      type: array
+      items:
+        type: string
+      description: Filter rules to be applied to the API response
+      default:
+        - '{ "filter": "exclude", "accountNumber" :  ["12345678","12345679"] }'
+  required:
+    - dataBlindKey
+    - tweak
+    - sensitiveFieldsSpecified
+    - eligibleHttpCodes
+    - dataBlindToken
+    - dataBlindPassphrase
+    - dataCryptService
+    - dataCryptApiKey
