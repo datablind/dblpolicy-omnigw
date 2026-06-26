@@ -757,9 +757,10 @@ dependencies = [
 
 [[package]]
 name = "dblpolicy_omni"
-version = "1.3.0"
+version = "1.4.4"
 dependencies = [
  "anyhow",
+ "flate2",
  "httpmock",
  "pdk",
  "pdk-test",

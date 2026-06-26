@@ -2,6 +2,8 @@
 mod generated;
 
 use anyhow::{anyhow, Result};
+use flate2::read::GzDecoder;
+use std::io::Read;
 
 use pdk::hl::*;
 use pdk::logger;
@@ -11,11 +13,11 @@ use serde_json::Value;
 
 use crate::generated::config::Config;
 
-const LOG_LABEL: &str = "DATABLIND_POLICY 6.0.12: ";
+const LOG_LABEL: &str = "DATABLIND_POLICY 6.0.12 v1.4.4: ";
 
-// The zt:encrypt-json and zt:filter-json connector operations are replaced by REST calls to this
-// path on the configured `dataCryptService`. The AI based redaction (when sensitive fields are not
-// manually specified) is served by the NLP path on the same host.
+// The zt:filter-json operation calls /Dev/filter. zt:encrypt-json calls /Dev/datacrypt.
+// AI based redaction (when sensitive fields are not manually specified) uses /Dev/datacrypt-nlp.
+const FILTER_PATH: &str = "/Dev/filter";
 const DATACRYPT_PATH: &str = "/Dev/datacrypt";
 const NLP_PATH: &str = "/Dev/datacrypt-nlp";
 
@@ -63,9 +65,129 @@ fn parse_json_lines(items: &[String]) -> Value {
     }
 }
 
-/// Interprets a DataCrypt token as JSON when possible so it can feed a subsequent operation.
-fn token_as_json(token: &str) -> Value {
-    serde_json::from_str(token).unwrap_or_else(|_| Value::String(token.to_string()))
+/// Parses the upstream response body as JSON when possible.
+fn parse_response_json(bytes: &[u8]) -> Value {
+    if bytes.is_empty() {
+        return Value::Object(serde_json::Map::new());
+    }
+
+    if let Ok(value) = serde_json::from_slice(bytes) {
+        return value;
+    }
+
+    // Upstream bodies are often gzip-compressed. We strip Content-Encoding before reading the
+    // body (required before set_body), so Envoy may deliver compressed bytes to the policy.
+    if is_gzip(bytes) {
+        if let Some(decompressed) = decompress_gzip(bytes) {
+            logger::info!(
+                "{LOG_LABEL}Decompressed gzip response body ({} -> {} bytes)",
+                bytes.len(),
+                decompressed.len()
+            );
+            if let Ok(value) = serde_json::from_slice(&decompressed) {
+                return value;
+            }
+            let text = String::from_utf8_lossy(&decompressed);
+            if let Ok(value) = serde_json::from_str(text.trim()) {
+                return value;
+            }
+        } else {
+            logger::warn!("{LOG_LABEL}Failed to decompress gzip response body");
+        }
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    if let Ok(value) = serde_json::from_str(text.trim()) {
+        return value;
+    }
+
+    logger::warn!(
+        "{LOG_LABEL}Unable to parse upstream response as JSON ({} bytes)",
+        bytes.len()
+    );
+    Value::String(text.into_owned())
+}
+
+fn is_gzip(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b
+}
+
+fn decompress_gzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).ok()?;
+    Some(decompressed)
+}
+
+/// DataCrypt filter/encrypt APIs require `data` to be a JSON object or array. When the Java
+/// service receives a JSON string scalar it calls `JsonNode.toString()`, which yields a quoted
+/// JSON string token that the filter rejects with "Unsupported JSON input type".
+fn normalize_data_for_datacrypt(value: Value) -> Value {
+    match value {
+        Value::Object(_) | Value::Array(_) => value,
+        Value::String(text) => {
+            if let Ok(parsed) = serde_json::from_str(text.trim()) {
+                return normalize_data_for_datacrypt(parsed);
+            }
+            let mut map = serde_json::Map::new();
+            map.insert("value".to_string(), Value::String(text));
+            Value::Object(map)
+        }
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("value".to_string(), other);
+            Value::Object(map)
+        }
+    }
+}
+
+/// Returns true when DataCrypt responded with its standard `{"error":"..."}` payload.
+fn is_datacrypt_error(token: &str) -> bool {
+    serde_json::from_str::<Value>(token)
+        .ok()
+        .and_then(|value| value.get("error").map(|error| error.is_string()))
+        .unwrap_or(false)
+}
+
+fn log_datacrypt_response(operation: &str, token: &str) {
+    logger::info!("{LOG_LABEL}{operation} response JSON: {token}");
+}
+
+/// Converts a DataCrypt token string into the `data` payload for a follow-on operation.
+/// Matches Mule, which passes the raw filter-json output string into encrypt-json.
+fn datacrypt_data_from_token(token: &str) -> Value {
+    let trimmed = token.trim();
+    match serde_json::from_str(trimmed) {
+        Ok(value) => normalize_data_for_datacrypt(value),
+        Err(err) => {
+            logger::warn!(
+                "{LOG_LABEL}Unable to parse DataCrypt token as JSON ({err}); using raw token text"
+            );
+            normalize_data_for_datacrypt(Value::String(trimmed.to_string()))
+        }
+    }
+}
+
+fn describe_data_for_log(value: &Value) -> String {
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return format!("error={{\"error\":\"{error}\"}}");
+    }
+
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<&String> = map.keys().take(8).collect();
+            format!("object keys={keys:?}")
+        }
+        Value::Array(items) => format!("array len={}", items.len()),
+        other => {
+            let compact = serde_json::to_string(other).unwrap_or_else(|_| other.to_string());
+            if compact.len() > 120 {
+                format!("{}...", &compact[..120])
+            } else {
+                compact
+            }
+        }
+    }
 }
 
 /// Performs a POST against the DataCrypt service and returns the resulting token.
@@ -107,6 +229,7 @@ async fn call_datacrypt(
 /// Reads the override token and passphrase from the inbound request so they are available when the
 /// upstream response is processed. These default to request headers in the policy definition.
 async fn request_filter(state: RequestState, config: &Config) -> Flow<OverrideCredentials> {
+    logger::info!("{LOG_LABEL}Processing inbound request headers for override credentials");
     let headers_state = state.into_headers_state().await;
 
     let mut token_eval = config.data_blind_token.evaluator();
@@ -140,6 +263,9 @@ async fn response_filter(
 
     let headers_state = state.into_headers_state().await;
     let status_code = headers_state.status_code();
+    logger::info!(
+        "{LOG_LABEL}Processing outbound response (status {status_code})"
+    );
 
     // Only apply DataBlind when the response status code is in the eligible list.
     let mut eligible_eval = config.eligible_http_codes.evaluator();
@@ -158,8 +284,14 @@ async fn response_filter(
         return;
     }
 
-    // Removing the content-length header is required before modifying the body.
-    headers_state.handler().remove_header("content-length");
+    // Strip encoding/length headers before reading or replacing the body. Upstream responses
+    // are often gzip-compressed; leaving Content-Encoding after set_body causes clients to fail
+    // decompression with "incorrect header check".
+    let headers_handler = headers_state.handler();
+    headers_handler.remove_header("content-length");
+    headers_handler.remove_header("content-encoding");
+    headers_handler.remove_header("transfer-encoding");
+    headers_handler.set_header("content-type", "application/json");
 
     let body_state = headers_state.into_body_state().await;
     let body_handler = body_state.handler();
@@ -179,18 +311,30 @@ async fn response_filter(
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
 
-    // The response payload is the data to protect. Fall back to a raw string if it is not JSON.
-    let mut data: Value = serde_json::from_slice(&payload_bytes)
-        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&payload_bytes).to_string()));
+    // The response payload is the data to protect. When filter runs, its raw token replaces this
+    // for the encrypt/NLP step (see Mule: vars.dblindOut default message.payload).
+    let upstream_data = normalize_data_for_datacrypt(parse_response_json(&payload_bytes));
+    let mut encrypt_data = upstream_data.clone();
+    logger::info!(
+        "{LOG_LABEL}Upstream response parsed ({} bytes, top-level type: {})",
+        payload_bytes.len(),
+        match &upstream_data {
+            Value::Object(_) => "object",
+            Value::Array(_) => "array",
+            Value::String(_) => "string",
+            _ => "other",
+        }
+    );
 
     let mut datablind_out: Option<String> = None;
+    let mut filter_out: Option<String> = None;
 
     // Step 1: optional filtering (replaces the zt:filter-json operation).
     if let Some(rules) = config.filter_rule.as_ref().filter(|rules| !rules.is_empty()) {
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: None,
-            data: data.clone(),
+            data: upstream_data.clone(),
             sensitive_fields: None,
             filter_rule: Some(parse_json_lines(rules)),
             over_ride_token: credentials.token.clone(),
@@ -200,16 +344,25 @@ async fn response_filter(
         match call_datacrypt(
             client,
             &config.data_crypt_service,
-            DATACRYPT_PATH,
+            FILTER_PATH,
             &request,
             Some(config.data_crypt_api_key.as_str()),
         )
         .await
         {
             Ok(token) => {
-                logger::info!("{LOG_LABEL}filterRule applied");
-                data = token_as_json(&token);
-                datablind_out = Some(token);
+                log_datacrypt_response("filterRule", &token);
+                filter_out = Some(token.clone());
+                encrypt_data = datacrypt_data_from_token(&token);
+                logger::info!(
+                    "{LOG_LABEL}Encrypt step will use filter output ({})",
+                    describe_data_for_log(&encrypt_data)
+                );
+                if is_datacrypt_error(&token) {
+                    logger::warn!("{LOG_LABEL}filterRule returned error: {token}");
+                } else {
+                    logger::info!("{LOG_LABEL}filterRule applied");
+                }
             }
             Err(err) => logger::warn!("{LOG_LABEL}filterRule call failed: {err}"),
         }
@@ -223,10 +376,15 @@ async fn response_filter(
             .filter(|fields| !fields.is_empty())
             .map(|fields| parse_json_lines(fields));
 
+        logger::info!(
+            "{LOG_LABEL}Calling encrypt-json with data: {}",
+            describe_data_for_log(&encrypt_data)
+        );
+
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: Some(tweak.clone()),
-            data: data.clone(),
+            data: encrypt_data.clone(),
             sensitive_fields,
             filter_rule: None,
             over_ride_token: credentials.token.clone(),
@@ -242,7 +400,16 @@ async fn response_filter(
         )
         .await
         {
-            Ok(token) => datablind_out = Some(token),
+            Ok(token) => {
+                if is_datacrypt_error(&token) {
+                    logger::warn!("{LOG_LABEL}encrypt-json returned error: {token}");
+                } else {
+                    log_datacrypt_response("encrypt-json", &token);
+                }
+                // Always replace the upstream body. Skipping set_body leaves the original
+                // gzip-compressed upstream payload without Content-Encoding (garbled in clients).
+                datablind_out = Some(token);
+            }
             Err(err) => logger::warn!("{LOG_LABEL}encrypt-json call failed: {err}"),
         }
     } else {
@@ -256,10 +423,15 @@ async fn response_filter(
             .filter(|key| !key.is_empty())
             .unwrap_or(config.data_crypt_api_key.as_str());
 
+        logger::info!(
+            "{LOG_LABEL}Calling datacrypt-nlp with data: {}",
+            describe_data_for_log(&encrypt_data)
+        );
+
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: Some(tweak.clone()),
-            data: data.clone(),
+            data: encrypt_data.clone(),
             sensitive_fields: None,
             filter_rule: None,
             over_ride_token: credentials.token.clone(),
@@ -275,17 +447,33 @@ async fn response_filter(
         )
         .await
         {
-            Ok(token) => datablind_out = Some(token),
+            Ok(token) => {
+                if is_datacrypt_error(&token) {
+                    logger::warn!("{LOG_LABEL}AI redaction returned error: {token}");
+                } else {
+                    log_datacrypt_response("datacrypt-nlp", &token);
+                }
+                datablind_out = Some(token);
+            }
             Err(err) => logger::warn!("{LOG_LABEL}AI redaction call failed: {err}"),
         }
     }
 
     // Step 3: replace the response body with the protected payload.
-    if let Some(out) = datablind_out {
+    let response_body = datablind_out.or(filter_out);
+    if let Some(out) = response_body {
+        logger::info!(
+            "{LOG_LABEL}Setting response body ({} bytes)",
+            out.len()
+        );
         match body_handler.set_body(out.as_bytes()) {
             Ok(_) => logger::info!("{LOG_LABEL}DataBlind encryption completed"),
             Err(err) => logger::warn!("{LOG_LABEL}Unable to set response body: {err:?}"),
         }
+    } else {
+        logger::warn!(
+            "{LOG_LABEL}No DataBlind output produced; upstream response body left unchanged"
+        );
     }
 }
 

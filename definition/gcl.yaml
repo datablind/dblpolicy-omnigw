@@ -46,54 +46,10 @@ spec:
       type: boolean
       description: If selected, then the sensitiveFields will be specified manually.
       default: false
-    dataBlindApiUri:
-      type: string
-      description: URI for AI based redaction service
-      default: "https://kwoz0lfnn8.execute-api.us-west-1.amazonaws.com/Dev/datacrypt-nlp"
-      "@rendering":
-        "@visibleOn":
-          - property: sensitiveFieldsSpecified
-            value: false
     dataBlindApiKey:
       type: string
       description: API Key for DataBlind AI Redaction API
       default: "Please contact mulesoftconnector@ztensor.com"
-      "@context":
-        "@characteristics":
-          - security:sensitive
-      "@rendering":
-        "@visibleOn":
-          - property: sensitiveFieldsSpecified
-            value: false
-    proxyHost:
-      type: string
-      description: Proxy host for accessing DataBlind AI Redaction Service URI
-      default: "0001"
-      "@rendering":
-        "@visibleOn":
-          - property: sensitiveFieldsSpecified
-            value: false
-    proxyPort:
-      type: string
-      description: Proxy port for accessing DataBlind AI Redaction Service URI
-      default: "8080"
-      "@rendering":
-        "@visibleOn":
-          - property: sensitiveFieldsSpecified
-            value: false
-    proxyUsername:
-      type: string
-      format: dataweave
-      description: Proxy username for accessing DataBlind AI Redaction Service URI
-      default: "proxyusername"
-      "@rendering":
-        "@visibleOn":
-          - property: sensitiveFieldsSpecified
-            value: false
-    proxyPassword:
-      type: string
-      description: Proxy password for accessing DataBlind AI Redaction Service URI
-      default: "proxypassword"
       "@context":
         "@characteristics":
           - security:sensitive
