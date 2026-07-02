@@ -23,6 +23,8 @@ pub struct Config {
     pub eligible_http_codes: pdk::script::Script,
     #[serde(alias = "filterRule")]
     pub filter_rule: Option<Vec<String>>,
+    #[serde(alias = "policyUsesMcpResponse")]
+    pub policy_uses_mcp_response: bool,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<Vec<String>>,
     #[serde(alias = "sensitiveFieldsSpecified")]

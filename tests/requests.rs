@@ -35,7 +35,7 @@ async fn hello() -> anyhow::Result<()> {
         .upstream(&httpmock_config)
         .path("/anything/echo/")
         .port(FLEX_PORT)
-        .outbound_policies([policy_config])
+        .inbound_policies([policy_config])
         .build();
 
     // Configure a Flex service

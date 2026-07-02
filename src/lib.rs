@@ -13,7 +13,8 @@ use serde_json::Value;
 
 use crate::generated::config::Config;
 
-const LOG_LABEL: &str = "DATABLIND_POLICY 6.0.12 v1.4.4: ";
+const LOG_LABEL: &str = "DATABLIND_POLICY 6.0.12 v1.5.7: ";
+const POLICY_INJECTION_POINT: &str = "inbound";
 
 // The zt:filter-json operation calls /Dev/filter. zt:encrypt-json calls /Dev/datacrypt.
 // AI based redaction (when sensitive fields are not manually specified) uses /Dev/datacrypt-nlp.
@@ -153,6 +154,13 @@ fn log_datacrypt_response(operation: &str, token: &str) {
     logger::info!("{LOG_LABEL}{operation} response JSON: {token}");
 }
 
+fn log_message(label: &str, bytes: impl AsRef<[u8]>) {
+    logger::info!(
+        "{LOG_LABEL}{label}: {}",
+        String::from_utf8_lossy(bytes.as_ref())
+    );
+}
+
 /// Converts a DataCrypt token string into the `data` payload for a follow-on operation.
 /// Matches Mule, which passes the raw filter-json output string into encrypt-json.
 fn datacrypt_data_from_token(token: &str) -> Value {
@@ -188,6 +196,38 @@ fn describe_data_for_log(value: &Value) -> String {
             }
         }
     }
+}
+
+/// Reads `content[0].text` from an MCP-style response envelope and parses it as JSON.
+fn extract_mcp_content_text(envelope: &Value) -> Result<Value> {
+    let text = envelope
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("MCP response missing content[0].text string"))?;
+
+    let parsed = serde_json::from_str(text.trim())
+        .map_err(|err| anyhow!("MCP content[0].text is not valid JSON: {err}"))?;
+    Ok(normalize_data_for_datacrypt(parsed))
+}
+
+/// Writes a DataCrypt token back into `content[0].text` on the MCP envelope.
+fn apply_mcp_content_text(envelope: &mut Value, token: &str) -> Result<()> {
+    let content_item = envelope
+        .pointer_mut("/content/0")
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| anyhow!("MCP response missing content[0] object"))?;
+
+    content_item.insert("text".to_string(), Value::String(token.to_string()));
+    Ok(())
+}
+
+fn serialize_mcp_envelope(envelope: &Value) -> Result<String> {
+    serde_json::to_string(envelope).map_err(|err| anyhow!("Failed to serialize MCP envelope: {err}"))
+}
+
+fn finalize_mcp_response(envelope: &mut Value, final_token: &str) -> Result<String> {
+    apply_mcp_content_text(envelope, final_token)?;
+    serialize_mcp_envelope(envelope)
 }
 
 /// Performs a POST against the DataCrypt service and returns the resulting token.
@@ -246,6 +286,9 @@ async fn request_filter(state: RequestState, config: &Config) -> Flow<OverrideCr
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
 
+    let body_state = headers_state.into_body_state().await;
+    log_message("Inbound message", body_state.handler().body());
+
     Flow::Continue(OverrideCredentials { token, passphrase })
 }
 
@@ -296,6 +339,7 @@ async fn response_filter(
     let body_state = headers_state.into_body_state().await;
     let body_handler = body_state.handler();
     let payload_bytes = body_handler.body();
+    log_message("Outbound message (upstream)", &payload_bytes);
 
     let key: String = config
         .data_blind_key
@@ -311,12 +355,32 @@ async fn response_filter(
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
 
-    // The response payload is the data to protect. When filter runs, its raw token replaces this
-    // for the encrypt/NLP step (see Mule: vars.dblindOut default message.payload).
+    // The response payload is the data to protect. When filter runs, each DataCrypt step feeds the
+    // next. In MCP mode, content[0].text is parsed once up front and written back once at the end.
     let upstream_data = normalize_data_for_datacrypt(parse_response_json(&payload_bytes));
-    let mut encrypt_data = upstream_data.clone();
+    let uses_mcp_response = config.policy_uses_mcp_response;
+    let mut mcp_envelope = upstream_data.clone();
+
+    let mut datacrypt_data = if uses_mcp_response {
+        match extract_mcp_content_text(&mcp_envelope) {
+            Ok(data) => {
+                logger::info!(
+                    "{LOG_LABEL}MCP content[0].text parsed for DataCrypt pipeline ({})",
+                    describe_data_for_log(&data)
+                );
+                data
+            }
+            Err(err) => {
+                logger::warn!("{LOG_LABEL}Unable to parse MCP content[0].text: {err}");
+                return;
+            }
+        }
+    } else {
+        upstream_data.clone()
+    };
+
     logger::info!(
-        "{LOG_LABEL}Upstream response parsed ({} bytes, top-level type: {})",
+        "{LOG_LABEL}Upstream response parsed ({} bytes, top-level type: {}, mcpResponse: {uses_mcp_response})",
         payload_bytes.len(),
         match &upstream_data {
             Value::Object(_) => "object",
@@ -326,15 +390,14 @@ async fn response_filter(
         }
     );
 
-    let mut datablind_out: Option<String> = None;
-    let mut filter_out: Option<String> = None;
+    let mut final_token: Option<String> = None;
 
     // Step 1: optional filtering (replaces the zt:filter-json operation).
     if let Some(rules) = config.filter_rule.as_ref().filter(|rules| !rules.is_empty()) {
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: None,
-            data: upstream_data.clone(),
+            data: datacrypt_data.clone(),
             sensitive_fields: None,
             filter_rule: Some(parse_json_lines(rules)),
             over_ride_token: credentials.token.clone(),
@@ -352,17 +415,17 @@ async fn response_filter(
         {
             Ok(token) => {
                 log_datacrypt_response("filterRule", &token);
-                filter_out = Some(token.clone());
-                encrypt_data = datacrypt_data_from_token(&token);
-                logger::info!(
-                    "{LOG_LABEL}Encrypt step will use filter output ({})",
-                    describe_data_for_log(&encrypt_data)
-                );
+                datacrypt_data = datacrypt_data_from_token(&token);
                 if is_datacrypt_error(&token) {
                     logger::warn!("{LOG_LABEL}filterRule returned error: {token}");
                 } else {
                     logger::info!("{LOG_LABEL}filterRule applied");
                 }
+                final_token = Some(token);
+                logger::info!(
+                    "{LOG_LABEL}Encrypt step will use filter output ({})",
+                    describe_data_for_log(&datacrypt_data)
+                );
             }
             Err(err) => logger::warn!("{LOG_LABEL}filterRule call failed: {err}"),
         }
@@ -378,13 +441,13 @@ async fn response_filter(
 
         logger::info!(
             "{LOG_LABEL}Calling encrypt-json with data: {}",
-            describe_data_for_log(&encrypt_data)
+            describe_data_for_log(&datacrypt_data)
         );
 
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: Some(tweak.clone()),
-            data: encrypt_data.clone(),
+            data: datacrypt_data.clone(),
             sensitive_fields,
             filter_rule: None,
             over_ride_token: credentials.token.clone(),
@@ -406,9 +469,7 @@ async fn response_filter(
                 } else {
                     log_datacrypt_response("encrypt-json", &token);
                 }
-                // Always replace the upstream body. Skipping set_body leaves the original
-                // gzip-compressed upstream payload without Content-Encoding (garbled in clients).
-                datablind_out = Some(token);
+                final_token = Some(token);
             }
             Err(err) => logger::warn!("{LOG_LABEL}encrypt-json call failed: {err}"),
         }
@@ -425,13 +486,13 @@ async fn response_filter(
 
         logger::info!(
             "{LOG_LABEL}Calling datacrypt-nlp with data: {}",
-            describe_data_for_log(&encrypt_data)
+            describe_data_for_log(&datacrypt_data)
         );
 
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: Some(tweak.clone()),
-            data: encrypt_data.clone(),
+            data: datacrypt_data.clone(),
             sensitive_fields: None,
             filter_rule: None,
             over_ride_token: credentials.token.clone(),
@@ -453,15 +514,27 @@ async fn response_filter(
                 } else {
                     log_datacrypt_response("datacrypt-nlp", &token);
                 }
-                datablind_out = Some(token);
+                final_token = Some(token);
             }
             Err(err) => logger::warn!("{LOG_LABEL}AI redaction call failed: {err}"),
         }
     }
 
     // Step 3: replace the response body with the protected payload.
-    let response_body = datablind_out.or(filter_out);
+    let response_body = if uses_mcp_response {
+        final_token.and_then(|token| {
+            finalize_mcp_response(&mut mcp_envelope, &token)
+                .map_err(|err| logger::warn!("{LOG_LABEL}Unable to finalize MCP response: {err}"))
+                .ok()
+        })
+    } else {
+        final_token
+    };
+
     if let Some(out) = response_body {
+        logger::info!(
+            "{LOG_LABEL}Outbound message (protected): {out}"
+        );
         logger::info!(
             "{LOG_LABEL}Setting response body ({} bytes)",
             out.len()
@@ -490,6 +563,11 @@ async fn configure(
             err
         )
     })?;
+
+    // Warn-level so this appears even when policy logging is set to warn in API Manager.
+    logger::warn!(
+        "{LOG_LABEL}Policy loaded ({POLICY_INJECTION_POINT} injection point, handlers: on_request + on_response)"
+    );
 
     let filter = on_request(|rs| request_filter(rs, &config))
         .on_response(|rs, request_data| response_filter(rs, request_data, &config, &client));

@@ -1,7 +1,7 @@
 # Copyright 2023 Salesforce, Inc. All rights reserved.
 [package]
 name = "dblpolicy_omni"
-version = "1.4.4"
+version = "1.5.7"
 rust-version = "1.87.0"
 edition = "2018"
 resolver = "2"
@@ -10,6 +10,8 @@ resolver = "2"
 
 [package.metadata.anypoint]
 group_id = "acda9d4d-1bfb-4b44-9b48-6f8f49157bbd"
+#group_id = "3a209eb5-371f-4b87-aaa2-19c539592cea"
+
 definition_asset_id = "dblpolicy-omni"
 implementation_asset_id = "dblpolicy-omni-flex"
 
