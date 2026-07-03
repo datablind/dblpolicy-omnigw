@@ -3,8 +3,8 @@ apiVersion: gateway.mulesoft.com/v1alpha1
 kind: Extension
 metadata:
   labels:
-    title: dblpolicy-omni
-    description: Protects sensitive PII data based on customer's token status
+    title: DataBlind AgentGuard
+    description: Cryptographic field governance for APIs and AI agent (MCP) responses
     category: Custom
     metadata/interfaceScope: api,resource
     metadata/capabilities/injectionPoint: inbound
@@ -33,8 +33,8 @@ spec:
     dataCryptService:
       type: string
       format: service
-      description: Base URI of the DataBlind DataCrypt REST service (hosts the encrypt/filter and AI redaction endpoints)
-      default: "https://kwoz0lfnn8.execute-api.us-west-1.amazonaws.com"
+      description: Base URI of the DataBlind DataCrypt REST service, including the API Gateway stage (e.g. .../Prod). Policy paths such as /filter are appended to this base.
+      default: "https://kwoz0lfnn8.execute-api.us-west-1.amazonaws.com/Dev"
     dataCryptApiKey:
       type: string
       description: API key sent as the x-api-key header when calling the DataBlind DataCrypt REST service
@@ -90,10 +90,6 @@ spec:
       description: Filter rules to be applied to the API response
       default:
         - '{ "filter": "exclude", "accountNumber" :  ["12345678","12345679"] }'
-    policyUsesMcpResponse:
-      type: boolean
-      description: Policy Uses MCP Response (reads and writes JSON in content[0].text)
-      default: false
   required:
     - dataBlindKey
     - tweak
@@ -103,4 +99,3 @@ spec:
     - dataBlindPassphrase
     - dataCryptService
     - dataCryptApiKey
-    - policyUsesMcpResponse

@@ -13,20 +13,38 @@ use serde_json::Value;
 
 use crate::generated::config::Config;
 
-const LOG_LABEL: &str = "DATABLIND_POLICY 6.0.12 v1.5.7: ";
+const LOG_LABEL: &str = "DATABLIND_AGENTGUARD 6.0.12 v1.6.3: ";
+const POLICY_VERSION: &str = "1.6.3";
 const POLICY_INJECTION_POINT: &str = "inbound";
+const DICTUM_HEADER: &str = "DataBlind-Dictum";
 
-// The zt:filter-json operation calls /Dev/filter. zt:encrypt-json calls /Dev/datacrypt.
-// AI based redaction (when sensitive fields are not manually specified) uses /Dev/datacrypt-nlp.
-const FILTER_PATH: &str = "/Dev/filter";
-const DATACRYPT_PATH: &str = "/Dev/datacrypt";
-const NLP_PATH: &str = "/Dev/datacrypt-nlp";
+// Endpoint paths appended to the stage/base path configured in dataCryptService
+// (e.g. .../Prod + /filter -> .../Prod/filter).
+const FILTER_PATH: &str = "/filter";
+const DATACRYPT_PATH: &str = "/datacrypt";
+const NLP_PATH: &str = "/datacrypt-nlp";
 
-/// Override credentials read from the inbound request and shared with the response phase.
+/// Override credentials and trace context read from the inbound request and shared with the
+/// response phase.
 #[derive(Clone, Default)]
-struct OverrideCredentials {
+struct RequestContext {
     token: String,
     passphrase: String,
+    trace_id: String,
+}
+
+/// Summary of DataBlind actions performed on a response, used to build the DataBlind-Dictum header.
+#[derive(Default)]
+struct DictumSummary {
+    actions: Vec<String>,
+}
+
+impl DictumSummary {
+    fn record_action(&mut self, action: &str) {
+        if !self.actions.iter().any(|existing| existing == action) {
+            self.actions.push(action.to_string());
+        }
+    }
 }
 
 /// Request body expected by the DataCrypt REST service (see DataCryptApp.RequestBody).
@@ -63,6 +81,164 @@ fn parse_json_lines(items: &[String]) -> Value {
         parsed.into_iter().next().unwrap_or(Value::Null)
     } else {
         Value::Array(parsed)
+    }
+}
+
+fn header_value(headers: &dyn HeadersHandler, name: &str) -> Option<String> {
+    headers
+        .header(name)
+        .or_else(|| {
+            headers.headers().into_iter().find_map(|(key, value)| {
+                if key.eq_ignore_ascii_case(name) {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Extracts the 32-hex trace-id segment from a W3C `traceparent` header value.
+fn extract_trace_id(traceparent: &str) -> Option<String> {
+    let parts: Vec<&str> = traceparent.trim().split('-').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let trace_id = parts[1];
+    if trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(trace_id.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn generate_trace_id() -> String {
+    let mut bytes = [0u8; 4];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        format!("db-{:08x}", u32::from_be_bytes(bytes))
+    } else {
+        "db-00000000".to_string()
+    }
+}
+
+fn get_or_generate_trace_id(headers: &dyn HeadersHandler) -> String {
+    if let Some(traceparent) = header_value(headers, "traceparent") {
+        if let Some(trace_id) = extract_trace_id(&traceparent) {
+            return trace_id;
+        }
+    }
+
+    if let Some(correlation_id) = header_value(headers, "X-Correlation-ID") {
+        return correlation_id;
+    }
+
+    generate_trace_id()
+}
+
+fn count_sensitive_fields(config: &Config) -> u32 {
+    let Some(lines) = config
+        .sensitive_fields_multi_line
+        .as_ref()
+        .filter(|fields| !fields.is_empty())
+    else {
+        return 0;
+    };
+
+    let parsed = parse_json_lines(lines);
+    match parsed {
+        Value::Object(map) => map.len() as u32,
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_object())
+            .map(|map| map.len() as u32)
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn format_dictum(summary: &DictumSummary, field_count: u32, trace_id: &str) -> String {
+    let action = if summary.actions.is_empty() {
+        "none".to_string()
+    } else {
+        summary.actions.join(",")
+    };
+
+    format!(
+        "action={action}; ver={POLICY_VERSION}; fields={field_count}; risk=low; trace={trace_id}"
+    )
+}
+
+#[cfg(test)]
+mod dictum_tests {
+    use super::*;
+
+    struct MockHeaders {
+        headers: Vec<(String, String)>,
+    }
+
+    impl HeadersHandler for MockHeaders {
+        fn headers(&self) -> Vec<(String, String)> {
+            self.headers.clone()
+        }
+
+        fn header(&self, name: &str) -> Option<String> {
+            self.headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        }
+
+        fn add_header(&self, _: &str, _: &str) {}
+        fn set_header(&self, _: &str, _: &str) {}
+        fn set_headers(&self, _: Vec<(&str, &str)>) {}
+        fn remove_header(&self, _: &str) {}
+    }
+
+    #[test]
+    fn extract_trace_id_from_traceparent() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        assert_eq!(
+            extract_trace_id(traceparent),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
+
+    #[test]
+    fn get_or_generate_trace_id_prefers_correlation_id() {
+        let headers = MockHeaders {
+            headers: vec![(
+                "X-Correlation-ID".to_string(),
+                "corr-12345".to_string(),
+            )],
+        };
+        assert_eq!(get_or_generate_trace_id(&headers), "corr-12345");
+    }
+
+    #[test]
+    fn join_uri_path_preserves_configured_stage() {
+        assert_eq!(join_uri_path("/Prod", "/filter"), "/Prod/filter");
+        assert_eq!(join_uri_path("/Prod", "/datacrypt"), "/Prod/datacrypt");
+        assert_eq!(join_uri_path("/Prod", "/datacrypt-nlp"), "/Prod/datacrypt-nlp");
+    }
+
+    #[test]
+    fn join_uri_path_supports_base_url_without_stage() {
+        assert_eq!(join_uri_path("/", "/Prod/filter"), "/Prod/filter");
+        assert_eq!(join_uri_path("", "/Prod/filter"), "/Prod/filter");
+    }
+
+    #[test]
+    fn format_dictum_matches_expected_shape() {
+        let mut dictum = DictumSummary::default();
+        dictum.record_action("filter");
+        dictum.record_action("datacrypt");
+        assert_eq!(
+            format_dictum(&dictum, 3, "db-8f2a1c91"),
+            "action=filter,datacrypt; ver=1.6.2; fields=3; risk=low; trace=db-8f2a1c91"
+        );
     }
 }
 
@@ -198,24 +374,24 @@ fn describe_data_for_log(value: &Value) -> String {
     }
 }
 
-/// Reads `content[0].text` from an MCP-style response envelope and parses it as JSON.
+/// Reads `result.content[0].text` from an MCP-style response envelope and parses it as JSON.
 fn extract_mcp_content_text(envelope: &Value) -> Result<Value> {
     let text = envelope
-        .pointer("/content/0/text")
+        .pointer("/result/content/0/text")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("MCP response missing content[0].text string"))?;
+        .ok_or_else(|| anyhow!("MCP response missing result.content[0].text string"))?;
 
     let parsed = serde_json::from_str(text.trim())
-        .map_err(|err| anyhow!("MCP content[0].text is not valid JSON: {err}"))?;
+        .map_err(|err| anyhow!("MCP result.content[0].text is not valid JSON: {err}"))?;
     Ok(normalize_data_for_datacrypt(parsed))
 }
 
-/// Writes a DataCrypt token back into `content[0].text` on the MCP envelope.
+/// Writes a DataCrypt token back into `result.content[0].text` on the MCP envelope.
 fn apply_mcp_content_text(envelope: &mut Value, token: &str) -> Result<()> {
     let content_item = envelope
-        .pointer_mut("/content/0")
+        .pointer_mut("/result/content/0")
         .and_then(|value| value.as_object_mut())
-        .ok_or_else(|| anyhow!("MCP response missing content[0] object"))?;
+        .ok_or_else(|| anyhow!("MCP response missing result.content[0] object"))?;
 
     content_item.insert("text".to_string(), Value::String(token.to_string()));
     Ok(())
@@ -230,29 +406,56 @@ fn finalize_mcp_response(envelope: &mut Value, final_token: &str) -> Result<Stri
     serialize_mcp_envelope(envelope)
 }
 
+fn join_uri_path(base_path: &str, endpoint_path: &str) -> String {
+    let base_path = base_path.trim_end_matches('/');
+    let endpoint = if endpoint_path.starts_with('/') {
+        endpoint_path
+    } else {
+        return format!("/{endpoint_path}");
+    };
+
+    if base_path.is_empty() || base_path == "/" {
+        endpoint.to_string()
+    } else {
+        format!("{base_path}{endpoint}")
+    }
+}
+
+fn join_service_path(service: &Service, endpoint_path: &str) -> String {
+    join_uri_path(service.uri().path(), endpoint_path)
+}
+
 /// Performs a POST against the DataCrypt service and returns the resulting token.
 async fn call_datacrypt(
     client: &HttpClient,
     service: &Service,
+    operation: &str,
     path: &str,
     request: &DataCryptRequest,
     api_key: Option<&str>,
 ) -> Result<String> {
+    let request_path = join_service_path(service, path);
     let body = serde_json::to_vec(request)?;
 
     let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
-    if let Some(key) = api_key {
+    if let Some(key) = api_key.filter(|key| !key.is_empty()) {
         headers.push(("x-api-key", key));
+    } else {
+        logger::warn!(
+            "{LOG_LABEL}{operation} call to {request_path} has no x-api-key header configured"
+        );
     }
+
+    logger::info!("{LOG_LABEL}Calling DataCrypt {operation} at {request_path}");
 
     let response = client
         .request(service)
-        .path(path)
+        .path(&request_path)
         .headers(headers)
         .body(&body)
         .post()
         .await
-        .map_err(|err| anyhow!("DataCrypt request failed: {err:?}"))?;
+        .map_err(|err| anyhow!("DataCrypt {operation} request to {request_path} failed: {err:?}"))?;
 
     let status = response.status_code();
     if status == 200 {
@@ -260,27 +463,52 @@ async fn call_datacrypt(
         Ok(parsed.token)
     } else {
         Err(anyhow!(
-            "DataCrypt service returned status {status}: {}",
+            "DataCrypt {operation} returned status {status} for {request_path}: {}",
             String::from_utf8_lossy(response.body())
         ))
     }
 }
 
-/// Reads the override token and passphrase from the inbound request so they are available when the
-/// upstream response is processed. These default to request headers in the policy definition.
-async fn request_filter(state: RequestState, config: &Config) -> Flow<OverrideCredentials> {
+fn normalized_api_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.contains("Please contact") || trimmed.contains('@') {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn warn_if_api_key_missing(label: &str, key: Option<&str>) {
+    if key.is_some() {
+        return;
+    }
+
+    logger::warn!(
+        "{LOG_LABEL}{label} is missing or still set to the placeholder value; DataCrypt calls will return 403 Forbidden until a valid x-api-key is configured in API Manager"
+    );
+}
+
+/// Reads override credentials and trace context from the inbound request so they are available
+/// when the upstream response is processed.
+async fn request_filter(state: RequestState, config: &Config) -> Flow<RequestContext> {
     logger::info!("{LOG_LABEL}Processing inbound request headers for override credentials");
     let headers_state = state.into_headers_state().await;
+    let headers_handler = headers_state.handler();
+    let trace_id = get_or_generate_trace_id(headers_handler);
 
     let mut token_eval = config.data_blind_token.evaluator();
-    token_eval.bind_attributes(&HandlerAttributesBinding::partial(headers_state.handler()));
+    token_eval.bind_attributes(&HandlerAttributesBinding::partial(headers_handler));
     let token: String = token_eval
         .eval()
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
 
     let mut passphrase_eval = config.data_blind_passphrase.evaluator();
-    passphrase_eval.bind_attributes(&HandlerAttributesBinding::partial(headers_state.handler()));
+    passphrase_eval.bind_attributes(&HandlerAttributesBinding::partial(headers_handler));
     let passphrase: String = passphrase_eval
         .eval()
         .and_then(TryFromValue::try_from_value)
@@ -289,19 +517,23 @@ async fn request_filter(state: RequestState, config: &Config) -> Flow<OverrideCr
     let body_state = headers_state.into_body_state().await;
     log_message("Inbound message", body_state.handler().body());
 
-    Flow::Continue(OverrideCredentials { token, passphrase })
+    Flow::Continue(RequestContext {
+        token,
+        passphrase,
+        trace_id,
+    })
 }
 
 /// Applies DataBlind protection to the upstream response when its status code is eligible.
 async fn response_filter(
     state: ResponseState,
-    request_data: RequestData<OverrideCredentials>,
+    request_data: RequestData<RequestContext>,
     config: &Config,
     client: &HttpClient,
 ) {
-    let credentials = match request_data {
-        RequestData::Continue(credentials) => credentials,
-        _ => OverrideCredentials::default(),
+    let request_context = match request_data {
+        RequestData::Continue(context) => context,
+        _ => RequestContext::default(),
     };
 
     let headers_state = state.into_headers_state().await;
@@ -336,10 +568,16 @@ async fn response_filter(
     headers_handler.remove_header("transfer-encoding");
     headers_handler.set_header("content-type", "application/json");
 
-    let body_state = headers_state.into_body_state().await;
-    let body_handler = body_state.handler();
-    let payload_bytes = body_handler.body();
+    let headers_body_state = headers_state.into_headers_body_state().await;
+    let headers_body_handler = headers_body_state.handler();
+    let payload_bytes = headers_body_handler.body();
     log_message("Outbound message (upstream)", &payload_bytes);
+
+    let credentials = request_context;
+    let mut dictum = DictumSummary::default();
+    let field_count = count_sensitive_fields(config);
+    let data_crypt_api_key = normalized_api_key(&config.data_crypt_api_key);
+    warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
     let key: String = config
         .data_blind_key
@@ -349,45 +587,32 @@ async fn response_filter(
         .unwrap_or_default();
 
     let mut tweak_eval = config.tweak.evaluator();
-    tweak_eval.bind_payload(&body_state);
+    tweak_eval.bind_payload(&headers_body_state);
     let tweak: String = tweak_eval
         .eval()
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
 
-    // The response payload is the data to protect. When filter runs, each DataCrypt step feeds the
-    // next. In MCP mode, content[0].text is parsed once up front and written back once at the end.
-    let upstream_data = normalize_data_for_datacrypt(parse_response_json(&payload_bytes));
-    let uses_mcp_response = config.policy_uses_mcp_response;
-    let mut mcp_envelope = upstream_data.clone();
-
-    let mut datacrypt_data = if uses_mcp_response {
-        match extract_mcp_content_text(&mcp_envelope) {
-            Ok(data) => {
-                logger::info!(
-                    "{LOG_LABEL}MCP content[0].text parsed for DataCrypt pipeline ({})",
-                    describe_data_for_log(&data)
-                );
-                data
-            }
-            Err(err) => {
-                logger::warn!("{LOG_LABEL}Unable to parse MCP content[0].text: {err}");
-                return;
-            }
+    // Parse the MCP envelope and extract result.content[0].text for the DataCrypt pipeline.
+    let mut mcp_envelope = normalize_data_for_datacrypt(parse_response_json(&payload_bytes));
+    let mut datacrypt_data = match extract_mcp_content_text(&mcp_envelope) {
+        Ok(data) => {
+            logger::info!(
+                "{LOG_LABEL}MCP result.content[0].text parsed for DataCrypt pipeline ({})",
+                describe_data_for_log(&data)
+            );
+            data
         }
-    } else {
-        upstream_data.clone()
+        Err(err) => {
+            logger::warn!("{LOG_LABEL}Unable to parse MCP result.content[0].text: {err}");
+            return;
+        }
     };
 
     logger::info!(
-        "{LOG_LABEL}Upstream response parsed ({} bytes, top-level type: {}, mcpResponse: {uses_mcp_response})",
+        "{LOG_LABEL}Upstream MCP response parsed ({} bytes, content: {})",
         payload_bytes.len(),
-        match &upstream_data {
-            Value::Object(_) => "object",
-            Value::Array(_) => "array",
-            Value::String(_) => "string",
-            _ => "other",
-        }
+        describe_data_for_log(&datacrypt_data)
     );
 
     let mut final_token: Option<String> = None;
@@ -407,13 +632,15 @@ async fn response_filter(
         match call_datacrypt(
             client,
             &config.data_crypt_service,
+            "filterRule",
             FILTER_PATH,
             &request,
-            Some(config.data_crypt_api_key.as_str()),
+            data_crypt_api_key.as_deref(),
         )
         .await
         {
             Ok(token) => {
+                dictum.record_action("filter");
                 log_datacrypt_response("filterRule", &token);
                 datacrypt_data = datacrypt_data_from_token(&token);
                 if is_datacrypt_error(&token) {
@@ -457,13 +684,15 @@ async fn response_filter(
         match call_datacrypt(
             client,
             &config.data_crypt_service,
+            "encrypt-json",
             DATACRYPT_PATH,
             &request,
-            Some(config.data_crypt_api_key.as_str()),
+            data_crypt_api_key.as_deref(),
         )
         .await
         {
             Ok(token) => {
+                dictum.record_action("datacrypt");
                 if is_datacrypt_error(&token) {
                     logger::warn!("{LOG_LABEL}encrypt-json returned error: {token}");
                 } else {
@@ -481,8 +710,9 @@ async fn response_filter(
         let api_key = config
             .data_blind_api_key
             .as_deref()
-            .filter(|key| !key.is_empty())
-            .unwrap_or(config.data_crypt_api_key.as_str());
+            .and_then(normalized_api_key)
+            .or_else(|| data_crypt_api_key.clone());
+        warn_if_api_key_missing("dataBlindApiKey", api_key.as_deref());
 
         logger::info!(
             "{LOG_LABEL}Calling datacrypt-nlp with data: {}",
@@ -502,13 +732,15 @@ async fn response_filter(
         match call_datacrypt(
             client,
             &config.data_crypt_service,
+            "datacrypt-nlp",
             NLP_PATH,
             &request,
-            Some(api_key),
+            api_key.as_deref(),
         )
         .await
         {
             Ok(token) => {
+                dictum.record_action("datacrypt-nlp");
                 if is_datacrypt_error(&token) {
                     logger::warn!("{LOG_LABEL}AI redaction returned error: {token}");
                 } else {
@@ -520,16 +752,12 @@ async fn response_filter(
         }
     }
 
-    // Step 3: replace the response body with the protected payload.
-    let response_body = if uses_mcp_response {
-        final_token.and_then(|token| {
-            finalize_mcp_response(&mut mcp_envelope, &token)
-                .map_err(|err| logger::warn!("{LOG_LABEL}Unable to finalize MCP response: {err}"))
-                .ok()
-        })
-    } else {
-        final_token
-    };
+    // Step 3: write the protected token back into result.content[0].text and replace the response body.
+    let response_body = final_token.and_then(|token| {
+        finalize_mcp_response(&mut mcp_envelope, &token)
+            .map_err(|err| logger::warn!("{LOG_LABEL}Unable to finalize MCP response: {err}"))
+            .ok()
+    });
 
     if let Some(out) = response_body {
         logger::info!(
@@ -539,7 +767,7 @@ async fn response_filter(
             "{LOG_LABEL}Setting response body ({} bytes)",
             out.len()
         );
-        match body_handler.set_body(out.as_bytes()) {
+        match headers_body_handler.set_body(out.as_bytes()) {
             Ok(_) => logger::info!("{LOG_LABEL}DataBlind encryption completed"),
             Err(err) => logger::warn!("{LOG_LABEL}Unable to set response body: {err:?}"),
         }
@@ -548,6 +776,10 @@ async fn response_filter(
             "{LOG_LABEL}No DataBlind output produced; upstream response body left unchanged"
         );
     }
+
+    let dictum_value = format_dictum(&dictum, field_count, &credentials.trace_id);
+    headers_body_handler.set_header(DICTUM_HEADER, &dictum_value);
+    logger::info!("{LOG_LABEL}Set {DICTUM_HEADER}: {dictum_value}");
 }
 
 #[entrypoint]
@@ -568,6 +800,20 @@ async fn configure(
     logger::warn!(
         "{LOG_LABEL}Policy loaded ({POLICY_INJECTION_POINT} injection point, handlers: on_request + on_response)"
     );
+    warn_if_api_key_missing(
+        "dataCryptApiKey",
+        normalized_api_key(&config.data_crypt_api_key).as_deref(),
+    );
+    if !config.sensitive_fields_specified {
+        warn_if_api_key_missing(
+            "dataBlindApiKey",
+            config
+                .data_blind_api_key
+                .as_deref()
+                .and_then(normalized_api_key)
+                .as_deref(),
+        );
+    }
 
     let filter = on_request(|rs| request_filter(rs, &config))
         .on_response(|rs, request_data| response_filter(rs, request_data, &config, &client));
