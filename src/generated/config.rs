@@ -21,8 +21,16 @@ pub struct Config {
     pub data_crypt_service: pdk::hl::Service,
     #[serde(alias = "eligibleHttpCodes", deserialize_with = "de_eligible_http_codes_3")]
     pub eligible_http_codes: pdk::script::Script,
-    #[serde(alias = "filterRule")]
-    pub filter_rule: Option<Vec<String>>,
+    #[serde(alias = "excludeField")]
+    pub exclude_field: Option<String>,
+    #[serde(alias = "excludeValue")]
+    pub exclude_value: Option<String>,
+    #[serde(alias = "filterMode")]
+    pub filter_mode: Option<String>,
+    #[serde(alias = "includeField")]
+    pub include_field: Option<String>,
+    #[serde(alias = "includeValue")]
+    pub include_value: Option<String>,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<Vec<String>>,
     #[serde(alias = "sensitiveFieldsSpecified")]

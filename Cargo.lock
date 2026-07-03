@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "datablind_agentguard"
-version = "1.6.3"
+version = "1.6.8"
 dependencies = [
  "anyhow",
  "flate2",

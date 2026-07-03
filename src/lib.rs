@@ -13,8 +13,10 @@ use serde_json::Value;
 
 use crate::generated::config::Config;
 
-const LOG_LABEL: &str = "DATABLIND_AGENTGUARD 6.0.12 v1.6.3: ";
-const POLICY_VERSION: &str = "1.6.3";
+// Policy version is sourced from the `version` field in Cargo.toml at compile time
+// (Cargo exposes it as CARGO_PKG_VERSION), so it never needs manual updating here.
+const POLICY_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LOG_LABEL: &str = concat!("DATABLIND_AGENTGUARD 6.0.12 v", env!("CARGO_PKG_VERSION"), ": ");
 const POLICY_INJECTION_POINT: &str = "inbound";
 const DICTUM_HEADER: &str = "DataBlind-Dictum";
 
@@ -67,6 +69,50 @@ struct DataCryptRequest {
 #[derive(Deserialize)]
 struct DataCryptResponse {
     token: String,
+}
+
+/// Builds the filter rule JSON sent to DataCrypt from the Filter Rule UI fields (filterMode plus
+/// the include/exclude field+value pairs). Returns `None` (skip the filter step) when the mode is
+/// "None"/unset or when the field for the selected mode is blank.
+fn build_filter_rule(config: &Config) -> Option<Value> {
+    // Normalize to lowercase so the emitted rule always uses "include"/"exclude" (what DataCrypt
+    // expects), regardless of how the mode is cased in the UI enum. Any mode other than
+    // include/exclude (e.g. the default "None") skips filtering entirely.
+    let mode = config
+        .filter_mode
+        .as_deref()
+        .unwrap_or("none")
+        .to_lowercase();
+    let (field, value) = match mode.as_str() {
+        "include" => (config.include_field.as_deref(), config.include_value.as_deref()),
+        "exclude" => (config.exclude_field.as_deref(), config.exclude_value.as_deref()),
+        _ => return None,
+    };
+
+    // Accept the field name with or without surrounding quotes (e.g. person.phone or
+    // "person.phone"), mirroring the value handling below.
+    let field = field
+        .map(|field| field.trim().trim_matches('"'))
+        .filter(|field| !field.is_empty())?;
+
+    let values: Vec<Value> = value
+        .unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim().trim_matches('"'))
+        .filter(|value| !value.is_empty())
+        .map(|value| Value::String(value.to_string()))
+        .collect();
+
+    let value = match values.len() {
+        0 => Value::String(String::new()),
+        1 => values.into_iter().next().unwrap_or(Value::Null),
+        _ => Value::Array(values),
+    };
+
+    let mut rule = serde_json::Map::new();
+    rule.insert("filter".to_string(), Value::String(mode.to_string()));
+    rule.insert(field.to_string(), value);
+    Some(Value::Object(rule))
 }
 
 /// Parses each configured JSON line. A single entry is used as-is; multiple entries become a JSON
@@ -506,6 +552,8 @@ async fn request_filter(state: RequestState, config: &Config) -> Flow<RequestCon
         .eval()
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
+    // TEMP(testing): logging raw secret value — remove before release.
+    // logger::info!("{LOG_LABEL}Resolved dataBlindToken: {token}");
 
     let mut passphrase_eval = config.data_blind_passphrase.evaluator();
     passphrase_eval.bind_attributes(&HandlerAttributesBinding::partial(headers_handler));
@@ -513,6 +561,8 @@ async fn request_filter(state: RequestState, config: &Config) -> Flow<RequestCon
         .eval()
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
+    // TEMP(testing): logging raw secret value — remove before release.
+    // logger::info!("{LOG_LABEL}Resolved dataBlindPassphrase: {passphrase}");
 
     let body_state = headers_state.into_body_state().await;
     log_message("Inbound message", body_state.handler().body());
@@ -549,6 +599,7 @@ async fn response_filter(
         .eval()
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
+    // logger::info!("{LOG_LABEL}Resolved eligibleHttpCodes: {eligible_codes}");
 
     let is_eligible = eligible_codes
         .split(',')
@@ -585,6 +636,8 @@ async fn response_filter(
         .eval()
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
+    // TEMP(testing): logging raw secret value — remove before release.
+    // logger::info!("{LOG_LABEL}Resolved dataBlindKey: {key}");
 
     let mut tweak_eval = config.tweak.evaluator();
     tweak_eval.bind_payload(&headers_body_state);
@@ -592,6 +645,7 @@ async fn response_filter(
         .eval()
         .and_then(TryFromValue::try_from_value)
         .unwrap_or_default();
+    // logger::info!("{LOG_LABEL}Resolved tweak: {tweak}");
 
     // Parse the MCP envelope and extract result.content[0].text for the DataCrypt pipeline.
     let mut mcp_envelope = normalize_data_for_datacrypt(parse_response_json(&payload_bytes));
@@ -618,13 +672,13 @@ async fn response_filter(
     let mut final_token: Option<String> = None;
 
     // Step 1: optional filtering (replaces the zt:filter-json operation).
-    if let Some(rules) = config.filter_rule.as_ref().filter(|rules| !rules.is_empty()) {
+    if let Some(filter_rule) = build_filter_rule(config) {
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: None,
             data: datacrypt_data.clone(),
             sensitive_fields: None,
-            filter_rule: Some(parse_json_lines(rules)),
+            filter_rule: Some(filter_rule),
             over_ride_token: credentials.token.clone(),
             over_ride_pass_phrase: credentials.passphrase.clone(),
         };

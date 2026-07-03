@@ -83,13 +83,58 @@ spec:
       format: dataweave
       description: When a valid override token passphrase is provided, Datablind returns the unencrypted and unmasked data
       default: "#[attributes.headers['dataBlindPassphrase']]"
-    filterRule:
-      type: array
-      items:
-        type: string
-      description: Filter rules to be applied to the API response
-      default:
-        - '{ "filter": "exclude", "accountNumber" :  ["12345678","12345679"] }'
+    filterMode:
+      type: string
+      title: Filter Rule
+      description: >-
+        Choose Include or Exclude filter.
+        Include filter will only include the matching message in the response, all others will be filtered out.
+        Exclude filter will exclude the matching message from the response, and any unmatched message will be included in the response.
+      enum:
+        - None
+        - Include
+        - Exclude
+      default: None
+    includeField:
+      type: string
+      title: Include Filter Json Field
+      description: >-
+        e.g. person.phone
+      default: ""
+      "@rendering":
+        "@visibleOn":
+          - property: filterMode
+            value: Include
+    includeValue:
+      type: string
+      title: Include Filter Json Value
+      description: >-
+        Include only the following values in the response (e.g. 1234567890, 0987654321).
+      default: ""
+      "@rendering":
+        "@visibleOn":
+          - property: filterMode
+            value: Include
+    excludeField:
+      type: string
+      title: Exclude Filter Json Field
+      description: >-
+        e.g. person.phone
+      default: ""
+      "@rendering":
+        "@visibleOn":
+          - property: filterMode
+            value: Exclude
+    excludeValue:
+      type: string
+      title: Exclude Filter Json Value
+      description: >-
+        Exclude the following values in the response (e.g. 1234567890, 0987654321).
+      default: ""
+      "@rendering":
+        "@visibleOn":
+          - property: filterMode
+            value: Exclude
   required:
     - dataBlindKey
     - tweak

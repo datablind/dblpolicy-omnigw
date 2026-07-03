@@ -1,7 +1,7 @@
 # Copyright 2023 Salesforce, Inc. All rights reserved.
 [package]
 name = "datablind_agentguard"
-version = "1.6.3"
+version = "1.6.8"
 rust-version = "1.87.0"
 edition = "2018"
 resolver = "2"
