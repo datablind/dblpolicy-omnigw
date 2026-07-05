@@ -1,7 +1,7 @@
 # Copyright 2023 Salesforce, Inc. All rights reserved.
 [package]
-name = "datablind_agentguard"
-version = "1.6.8"
+name = "mcp_datablind"
+version = "1.7.1"
 rust-version = "1.87.0"
 edition = "2018"
 resolver = "2"
@@ -12,8 +12,8 @@ resolver = "2"
 group_id = "acda9d4d-1bfb-4b44-9b48-6f8f49157bbd"
 #group_id = "3a209eb5-371f-4b87-aaa2-19c539592cea"
 
-definition_asset_id = "datablind-agentguard"
-implementation_asset_id = "datablind-agentguard-flex"
+definition_asset_id = "mcp-datablind"
+implementation_asset_id = "mcp-datablind-flex"
 
 [dependencies]
 pdk = { version = "1.9.0", features = ["enable_stop_iteration"] }
