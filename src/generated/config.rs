@@ -1,8 +1,6 @@
 use serde::Deserialize;
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
-    #[serde(alias = "dataBlindApiKey")]
-    pub data_blind_api_key: Option<String>,
     #[serde(alias = "dataBlindKey", deserialize_with = "de_data_blind_key_0")]
     pub data_blind_key: pdk::script::Script,
     #[serde(
@@ -21,6 +19,8 @@ pub struct Config {
     pub data_crypt_service: pdk::hl::Service,
     #[serde(alias = "eligibleHttpCodes", deserialize_with = "de_eligible_http_codes_3")]
     pub eligible_http_codes: pdk::script::Script,
+    #[serde(alias = "encryptMode")]
+    pub encrypt_mode: Option<String>,
     #[serde(alias = "excludeField")]
     pub exclude_field: Option<String>,
     #[serde(alias = "excludeValue")]
@@ -33,8 +33,6 @@ pub struct Config {
     pub include_value: Option<String>,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<Vec<String>>,
-    #[serde(alias = "sensitiveFieldsSpecified")]
-    pub sensitive_fields_specified: bool,
     #[serde(alias = "tweak", deserialize_with = "de_tweak_4")]
     pub tweak: pdk::script::Script,
 }

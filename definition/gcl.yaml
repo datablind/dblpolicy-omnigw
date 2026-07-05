@@ -3,8 +3,8 @@ apiVersion: gateway.mulesoft.com/v1alpha1
 kind: Extension
 metadata:
   labels:
-    title: DataBlind AgentGuard
-    description: Cryptographic field governance for APIs and AI agent (MCP) responses
+    title: MCP DataBlind
+    description: Cryptographic field governance for APIs and Agents in MCP response
     category: Custom
     metadata/interfaceScope: api,resource
     metadata/capabilities/injectionPoint: inbound
@@ -21,15 +21,6 @@ spec:
       "@context":
         "@characteristics":
           - security:sensitive
-    tweak:
-      type: string
-      format: dataweave
-      description: Payload Field to be used as Encryption Tweak
-      default: "#[payload.Id default '12345678']"
-      bindings:
-        payload:
-          mimeType: json
-        attributes: true
     dataCryptService:
       type: string
       format: service
@@ -42,21 +33,15 @@ spec:
       "@context":
         "@characteristics":
           - security:sensitive
-    sensitiveFieldsSpecified:
-      type: boolean
-      description: If selected, then the sensitiveFields will be specified manually.
-      default: false
-    dataBlindApiKey:
+    encryptMode:
       type: string
-      description: API Key for DataBlind AI Redaction API
-      default: "Please contact mulesoftconnector@ztensor.com"
-      "@context":
-        "@characteristics":
-          - security:sensitive
-      "@rendering":
-        "@visibleOn":
-          - property: sensitiveFieldsSpecified
-            value: false
+      title: Encrypt
+      description: Choose how the sensitive fields are provided for encryption
+      enum:
+        - None
+        - Specify Sensitive fields
+        - Determine Sensitive fields using NLP (Identifies PII related to Financial, Contact, Identity, Auth, Device, Tax, Health, Vehicle, GOV ID, and URL data)
+      default: None
     sensitiveFieldsMultiLine:
       type: array
       items:
@@ -66,23 +51,8 @@ spec:
         - '{ "Name" : "FE:PersonName", "TaxId" : "FE:SSN" }'
       "@rendering":
         "@visibleOn":
-          - property: sensitiveFieldsSpecified
-            value: true
-    eligibleHttpCodes:
-      type: string
-      format: dataweave
-      description: Apply Datablind only when the API response has the following HTTP Codes
-      default: "#['200,201,202,205,213']"
-    dataBlindToken:
-      type: string
-      format: dataweave
-      description: When a valid override token is provided, Datablind returns the unencrypted and unmasked data
-      default: "#[attributes.headers['dataBlindToken']]"
-    dataBlindPassphrase:
-      type: string
-      format: dataweave
-      description: When a valid override token passphrase is provided, Datablind returns the unencrypted and unmasked data
-      default: "#[attributes.headers['dataBlindPassphrase']]"
+          - property: encryptMode
+            value: Specify Sensitive fields
     filterMode:
       type: string
       title: Filter Rule
@@ -135,10 +105,33 @@ spec:
         "@visibleOn":
           - property: filterMode
             value: Exclude
+    tweak:
+      type: string
+      format: dataweave
+      description: Payload Field to be used as Encryption Tweak
+      default: "#[payload.Id default '12345678']"
+      bindings:
+        payload:
+          mimeType: json
+        attributes: true
+    eligibleHttpCodes:
+      type: string
+      format: dataweave
+      description: Apply Datablind only when the API response has the following HTTP Codes
+      default: "#['200,201,202,205,213']"
+    dataBlindToken:
+      type: string
+      format: dataweave
+      description: When a valid override token is provided, Datablind returns the unencrypted and unmasked data
+      default: "#[attributes.headers['dataBlindToken']]"
+    dataBlindPassphrase:
+      type: string
+      format: dataweave
+      description: When a valid override token passphrase is provided, Datablind returns the unencrypted and unmasked data
+      default: "#[attributes.headers['dataBlindPassphrase']]"
   required:
     - dataBlindKey
     - tweak
-    - sensitiveFieldsSpecified
     - eligibleHttpCodes
     - dataBlindToken
     - dataBlindPassphrase

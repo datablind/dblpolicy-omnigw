@@ -3,7 +3,7 @@ mod generated;
 
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
-use std::io::Read;
+use std::{io::Read, ops::Deref};
 
 use pdk::hl::*;
 use pdk::logger;
@@ -11,12 +11,12 @@ use pdk::script::{HandlerAttributesBinding, TryFromValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::generated::config::Config;
+use crate::generated::config::Config as GeneratedConfig;
 
 // Policy version is sourced from the `version` field in Cargo.toml at compile time
 // (Cargo exposes it as CARGO_PKG_VERSION), so it never needs manual updating here.
 const POLICY_VERSION: &str = env!("CARGO_PKG_VERSION");
-const LOG_LABEL: &str = concat!("DATABLIND_AGENTGUARD 6.0.12 v", env!("CARGO_PKG_VERSION"), ": ");
+const LOG_LABEL: &str = concat!("MCP_DATABLIND 6.0.12 v", env!("CARGO_PKG_VERSION"), ": ");
 const POLICY_INJECTION_POINT: &str = "inbound";
 const DICTUM_HEADER: &str = "DataBlind-Dictum";
 
@@ -25,6 +25,88 @@ const DICTUM_HEADER: &str = "DataBlind-Dictum";
 const FILTER_PATH: &str = "/filter";
 const DATACRYPT_PATH: &str = "/datacrypt";
 const NLP_PATH: &str = "/datacrypt-nlp";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncryptMode {
+    None,
+    SpecifySensitiveFields,
+    DetermineFieldsUsingNlp,
+}
+
+#[derive(Deserialize)]
+struct ConfigCompatibility {
+    #[serde(alias = "sensitiveFieldsSpecified")]
+    sensitive_fields_specified: Option<bool>,
+}
+
+#[derive(Clone)]
+struct RuntimeConfig {
+    inner: GeneratedConfig,
+    encrypt_mode: EncryptMode,
+}
+
+impl RuntimeConfig {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let inner: GeneratedConfig = serde_json::from_slice(bytes).map_err(|err| {
+            anyhow!(
+                "Failed to parse configuration '{}'. Cause: {}",
+                String::from_utf8_lossy(bytes),
+                err
+            )
+        })?;
+        let compatibility: ConfigCompatibility = serde_json::from_slice(bytes).map_err(|err| {
+            anyhow!(
+                "Failed to parse configuration compatibility '{}'. Cause: {}",
+                String::from_utf8_lossy(bytes),
+                err
+            )
+        })?;
+
+        Ok(Self {
+            encrypt_mode: resolve_encrypt_mode(
+                inner.encrypt_mode.as_deref(),
+                compatibility.sensitive_fields_specified,
+            ),
+            inner,
+        })
+    }
+}
+
+impl Deref for RuntimeConfig {
+    type Target = GeneratedConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+fn resolve_encrypt_mode(
+    encrypt_mode: Option<&str>,
+    legacy_sensitive_fields_specified: Option<bool>,
+) -> EncryptMode {
+    match encrypt_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("none") => EncryptMode::None,
+        Some("specify sensitive fields") | Some("specify pii (sensitive) fields") => {
+            EncryptMode::SpecifySensitiveFields
+        }
+        Some(
+            "determine sensitive fields using nlp (identifies pii related to financial, contact, identity, auth, device, tax, health, vehicle, gov id, and url data)",
+        )
+        | Some("determine sensitive fields using nlp")
+        | Some("determine pii (sensitive) fields using nlp")
+        | Some("determine fields using nlp") => EncryptMode::DetermineFieldsUsingNlp,
+        Some(_) | None => match legacy_sensitive_fields_specified {
+            Some(true) => EncryptMode::SpecifySensitiveFields,
+            Some(false) => EncryptMode::DetermineFieldsUsingNlp,
+            None => EncryptMode::None,
+        },
+    }
+}
 
 /// Override credentials and trace context read from the inbound request and shared with the
 /// response phase.
@@ -74,7 +156,7 @@ struct DataCryptResponse {
 /// Builds the filter rule JSON sent to DataCrypt from the Filter Rule UI fields (filterMode plus
 /// the include/exclude field+value pairs). Returns `None` (skip the filter step) when the mode is
 /// "None"/unset or when the field for the selected mode is blank.
-fn build_filter_rule(config: &Config) -> Option<Value> {
+fn build_filter_rule(config: &RuntimeConfig) -> Option<Value> {
     // Normalize to lowercase so the emitted rule always uses "include"/"exclude" (what DataCrypt
     // expects), regardless of how the mode is cased in the UI enum. Any mode other than
     // include/exclude (e.g. the default "None") skips filtering entirely.
@@ -184,7 +266,7 @@ fn get_or_generate_trace_id(headers: &dyn HeadersHandler) -> String {
     generate_trace_id()
 }
 
-fn count_sensitive_fields(config: &Config) -> u32 {
+fn count_sensitive_fields(config: &RuntimeConfig) -> u32 {
     let Some(lines) = config
         .sensitive_fields_multi_line
         .as_ref()
@@ -283,8 +365,74 @@ mod dictum_tests {
         dictum.record_action("datacrypt");
         assert_eq!(
             format_dictum(&dictum, 3, "db-8f2a1c91"),
-            "action=filter,datacrypt; ver=1.6.2; fields=3; risk=low; trace=db-8f2a1c91"
+            format!(
+                "action=filter,datacrypt; ver={POLICY_VERSION}; fields=3; risk=low; trace=db-8f2a1c91"
+            )
         );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_defaults_to_none_for_new_configs() {
+        assert_eq!(
+            resolve_encrypt_mode(Some("None"), None),
+            EncryptMode::None
+        );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_uses_manual_mode_from_new_config() {
+        assert_eq!(
+            resolve_encrypt_mode(Some("Specify Sensitive fields"), None),
+            EncryptMode::SpecifySensitiveFields
+        );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_uses_nlp_mode_from_new_config() {
+        assert_eq!(
+            resolve_encrypt_mode(
+                Some("Determine Sensitive fields using NLP (Identifies PII related to Financial, Contact, Identity, Auth, Device, Tax, Health, Vehicle, GOV ID, and URL data)"),
+                Some(true)
+            ),
+            EncryptMode::DetermineFieldsUsingNlp
+        );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_keeps_support_for_previous_manual_label() {
+        assert_eq!(
+            resolve_encrypt_mode(Some("Specify Sensitive Fields"), None),
+            EncryptMode::SpecifySensitiveFields
+        );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_keeps_support_for_previous_nlp_label() {
+        assert_eq!(
+            resolve_encrypt_mode(Some("Determine fields using NLP"), None),
+            EncryptMode::DetermineFieldsUsingNlp
+        );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_falls_back_to_legacy_manual_flag() {
+        assert_eq!(
+            resolve_encrypt_mode(None, Some(true)),
+            EncryptMode::SpecifySensitiveFields
+        );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_falls_back_to_legacy_nlp_flag() {
+        assert_eq!(
+            resolve_encrypt_mode(None, Some(false)),
+            EncryptMode::DetermineFieldsUsingNlp
+        );
+    }
+
+    #[test]
+    fn resolve_encrypt_mode_treats_missing_values_as_none() {
+        assert_eq!(resolve_encrypt_mode(None, None), EncryptMode::None);
     }
 }
 
@@ -540,7 +688,7 @@ fn warn_if_api_key_missing(label: &str, key: Option<&str>) {
 
 /// Reads override credentials and trace context from the inbound request so they are available
 /// when the upstream response is processed.
-async fn request_filter(state: RequestState, config: &Config) -> Flow<RequestContext> {
+async fn request_filter(state: RequestState, config: &RuntimeConfig) -> Flow<RequestContext> {
     logger::info!("{LOG_LABEL}Processing inbound request headers for override credentials");
     let headers_state = state.into_headers_state().await;
     let headers_handler = headers_state.handler();
@@ -578,7 +726,7 @@ async fn request_filter(state: RequestState, config: &Config) -> Flow<RequestCon
 async fn response_filter(
     state: ResponseState,
     request_data: RequestData<RequestContext>,
-    config: &Config,
+    config: &RuntimeConfig,
     client: &HttpClient,
 ) {
     let request_context = match request_data {
@@ -712,97 +860,96 @@ async fn response_filter(
         }
     }
 
-    // Step 2: encryption. Use manually specified sensitive fields, or AI based redaction otherwise.
-    if config.sensitive_fields_specified {
-        let sensitive_fields = config
-            .sensitive_fields_multi_line
-            .as_ref()
-            .filter(|fields| !fields.is_empty())
-            .map(|fields| parse_json_lines(fields));
-
-        logger::info!(
-            "{LOG_LABEL}Calling encrypt-json with data: {}",
-            describe_data_for_log(&datacrypt_data)
-        );
-
-        let request = DataCryptRequest {
-            key: key.clone(),
-            tweak: Some(tweak.clone()),
-            data: datacrypt_data.clone(),
-            sensitive_fields,
-            filter_rule: None,
-            over_ride_token: credentials.token.clone(),
-            over_ride_pass_phrase: credentials.passphrase.clone(),
-        };
-
-        match call_datacrypt(
-            client,
-            &config.data_crypt_service,
-            "encrypt-json",
-            DATACRYPT_PATH,
-            &request,
-            data_crypt_api_key.as_deref(),
-        )
-        .await
-        {
-            Ok(token) => {
-                dictum.record_action("datacrypt");
-                if is_datacrypt_error(&token) {
-                    logger::warn!("{LOG_LABEL}encrypt-json returned error: {token}");
-                } else {
-                    log_datacrypt_response("encrypt-json", &token);
-                }
-                final_token = Some(token);
-            }
-            Err(err) => logger::warn!("{LOG_LABEL}encrypt-json call failed: {err}"),
+    // Step 2: encryption. Use manually specified sensitive fields, AI based redaction, or skip.
+    match config.encrypt_mode {
+        EncryptMode::None => {
+            logger::info!("{LOG_LABEL}Encrypt mode is None; skipping encryption step");
         }
-    } else {
-        logger::info!(
-            "{LOG_LABEL}Sensitive fields not specified, using AI to determine sensitive fields"
-        );
+        EncryptMode::SpecifySensitiveFields => {
+            let sensitive_fields = config
+                .sensitive_fields_multi_line
+                .as_ref()
+                .filter(|fields| !fields.is_empty())
+                .map(|fields| parse_json_lines(fields));
 
-        let api_key = config
-            .data_blind_api_key
-            .as_deref()
-            .and_then(normalized_api_key)
-            .or_else(|| data_crypt_api_key.clone());
-        warn_if_api_key_missing("dataBlindApiKey", api_key.as_deref());
+            logger::info!(
+                "{LOG_LABEL}Calling encrypt-json with data: {}",
+                describe_data_for_log(&datacrypt_data)
+            );
 
-        logger::info!(
-            "{LOG_LABEL}Calling datacrypt-nlp with data: {}",
-            describe_data_for_log(&datacrypt_data)
-        );
+            let request = DataCryptRequest {
+                key: key.clone(),
+                tweak: Some(tweak.clone()),
+                data: datacrypt_data.clone(),
+                sensitive_fields,
+                filter_rule: None,
+                over_ride_token: credentials.token.clone(),
+                over_ride_pass_phrase: credentials.passphrase.clone(),
+            };
 
-        let request = DataCryptRequest {
-            key: key.clone(),
-            tweak: Some(tweak.clone()),
-            data: datacrypt_data.clone(),
-            sensitive_fields: None,
-            filter_rule: None,
-            over_ride_token: credentials.token.clone(),
-            over_ride_pass_phrase: credentials.passphrase.clone(),
-        };
-
-        match call_datacrypt(
-            client,
-            &config.data_crypt_service,
-            "datacrypt-nlp",
-            NLP_PATH,
-            &request,
-            api_key.as_deref(),
-        )
-        .await
-        {
-            Ok(token) => {
-                dictum.record_action("datacrypt-nlp");
-                if is_datacrypt_error(&token) {
-                    logger::warn!("{LOG_LABEL}AI redaction returned error: {token}");
-                } else {
-                    log_datacrypt_response("datacrypt-nlp", &token);
+            match call_datacrypt(
+                client,
+                &config.data_crypt_service,
+                "encrypt-json",
+                DATACRYPT_PATH,
+                &request,
+                data_crypt_api_key.as_deref(),
+            )
+            .await
+            {
+                Ok(token) => {
+                    dictum.record_action("datacrypt");
+                    if is_datacrypt_error(&token) {
+                        logger::warn!("{LOG_LABEL}encrypt-json returned error: {token}");
+                    } else {
+                        log_datacrypt_response("encrypt-json", &token);
+                    }
+                    final_token = Some(token);
                 }
-                final_token = Some(token);
+                Err(err) => logger::warn!("{LOG_LABEL}encrypt-json call failed: {err}"),
             }
-            Err(err) => logger::warn!("{LOG_LABEL}AI redaction call failed: {err}"),
+        }
+        EncryptMode::DetermineFieldsUsingNlp => {
+            logger::info!(
+                "{LOG_LABEL}Sensitive fields not specified, using AI to determine sensitive fields"
+            );
+
+            logger::info!(
+                "{LOG_LABEL}Calling datacrypt-nlp with data: {}",
+                describe_data_for_log(&datacrypt_data)
+            );
+
+            let request = DataCryptRequest {
+                key: key.clone(),
+                tweak: Some(tweak.clone()),
+                data: datacrypt_data.clone(),
+                sensitive_fields: None,
+                filter_rule: None,
+                over_ride_token: credentials.token.clone(),
+                over_ride_pass_phrase: credentials.passphrase.clone(),
+            };
+
+            match call_datacrypt(
+                client,
+                &config.data_crypt_service,
+                "datacrypt-nlp",
+                NLP_PATH,
+                &request,
+                data_crypt_api_key.as_deref(),
+            )
+            .await
+            {
+                Ok(token) => {
+                    dictum.record_action("datacrypt-nlp");
+                    if is_datacrypt_error(&token) {
+                        logger::warn!("{LOG_LABEL}AI redaction returned error: {token}");
+                    } else {
+                        log_datacrypt_response("datacrypt-nlp", &token);
+                    }
+                    final_token = Some(token);
+                }
+                Err(err) => logger::warn!("{LOG_LABEL}AI redaction call failed: {err}"),
+            }
         }
     }
 
@@ -842,13 +989,7 @@ async fn configure(
     Configuration(bytes): Configuration,
     client: HttpClient,
 ) -> Result<()> {
-    let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
-        anyhow!(
-            "Failed to parse configuration '{}'. Cause: {}",
-            String::from_utf8_lossy(&bytes),
-            err
-        )
-    })?;
+    let config = RuntimeConfig::from_bytes(&bytes)?;
 
     // Warn-level so this appears even when policy logging is set to warn in API Manager.
     logger::warn!(
@@ -858,16 +999,6 @@ async fn configure(
         "dataCryptApiKey",
         normalized_api_key(&config.data_crypt_api_key).as_deref(),
     );
-    if !config.sensitive_fields_specified {
-        warn_if_api_key_missing(
-            "dataBlindApiKey",
-            config
-                .data_blind_api_key
-                .as_deref()
-                .and_then(normalized_api_key)
-                .as_deref(),
-        );
-    }
 
     let filter = on_request(|rs| request_filter(rs, &config))
         .on_response(|rs, request_data| response_filter(rs, request_data, &config, &client));
