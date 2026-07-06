@@ -197,19 +197,10 @@ fn build_filter_rule(config: &RuntimeConfig) -> Option<Value> {
     Some(Value::Object(rule))
 }
 
-/// Parses each configured JSON line. A single entry is used as-is; multiple entries become a JSON
-/// array, mirroring the `read(..., 'application/json')` handling in the original policy template.
-fn parse_json_lines(items: &[String]) -> Value {
-    let parsed: Vec<Value> = items
-        .iter()
-        .map(|item| serde_json::from_str(item).unwrap_or_else(|_| Value::String(item.clone())))
-        .collect();
-
-    if parsed.len() == 1 {
-        parsed.into_iter().next().unwrap_or(Value::Null)
-    } else {
-        Value::Array(parsed)
-    }
+/// Parses a configured JSON line: used as-is when it is valid JSON, otherwise treated as a plain
+/// string, mirroring the `read(..., 'application/json')` handling in the original policy template.
+fn parse_json_line(item: &str) -> Value {
+    serde_json::from_str(item).unwrap_or_else(|_| Value::String(item.to_string()))
 }
 
 fn header_value(headers: &dyn HeadersHandler, name: &str) -> Option<String> {
@@ -267,16 +258,16 @@ fn get_or_generate_trace_id(headers: &dyn HeadersHandler) -> String {
 }
 
 fn count_sensitive_fields(config: &RuntimeConfig) -> u32 {
-    let Some(lines) = config
+    let Some(text) = config
         .sensitive_fields_multi_line
-        .as_ref()
+        .as_deref()
+        .map(str::trim)
         .filter(|fields| !fields.is_empty())
     else {
         return 0;
     };
 
-    let parsed = parse_json_lines(lines);
-    match parsed {
+    match parse_json_line(text) {
         Value::Object(map) => map.len() as u32,
         Value::Array(items) => items
             .iter()
@@ -868,9 +859,10 @@ async fn response_filter(
         EncryptMode::SpecifySensitiveFields => {
             let sensitive_fields = config
                 .sensitive_fields_multi_line
-                .as_ref()
+                .as_deref()
+                .map(str::trim)
                 .filter(|fields| !fields.is_empty())
-                .map(|fields| parse_json_lines(fields));
+                .map(parse_json_line);
 
             logger::info!(
                 "{LOG_LABEL}Calling encrypt-json with data: {}",

@@ -32,7 +32,7 @@ pub struct Config {
     #[serde(alias = "includeValue")]
     pub include_value: Option<String>,
     #[serde(alias = "sensitiveFieldsMultiLine")]
-    pub sensitive_fields_multi_line: Option<Vec<String>>,
+    pub sensitive_fields_multi_line: Option<String>,
     #[serde(alias = "tweak", deserialize_with = "de_tweak_4")]
     pub tweak: pdk::script::Script,
 }

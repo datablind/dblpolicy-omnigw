@@ -13,29 +13,9 @@ spec:
     - name: extension-definition
       namespace: default
   properties:
-    dataBlindKey:
-      type: string
-      format: dataweave
-      description: Encryption Key used by the DataBlind
-      default: "#['1234567812345678']"
-      "@context":
-        "@characteristics":
-          - security:sensitive
-    dataCryptService:
-      type: string
-      format: service
-      description: Base URI of the DataBlind DataCrypt REST service, including the API Gateway stage (e.g. .../Prod). Policy paths such as /filter are appended to this base.
-      default: "https://kwoz0lfnn8.execute-api.us-west-1.amazonaws.com/Dev"
-    dataCryptApiKey:
-      type: string
-      description: API key sent as the x-api-key header when calling the DataBlind DataCrypt REST service
-      default: "Please contact mulesoftconnector@ztensor.com"
-      "@context":
-        "@characteristics":
-          - security:sensitive
     encryptMode:
       type: string
-      title: Encrypt
+      title: 1. Sensitive Data Encryption
       description: Choose how the sensitive fields are provided for encryption
       enum:
         - None
@@ -43,19 +23,17 @@ spec:
         - Determine Sensitive fields using NLP (Identifies PII related to Financial, Contact, Identity, Auth, Device, Tax, Health, Vehicle, GOV ID, and URL data)
       default: None
     sensitiveFieldsMultiLine:
-      type: array
-      items:
-        type: string
-      description: Multi Line Sensitive fields in the API response (use Add to add more entries)
-      default:
-        - '{ "Name" : "FE:PersonName", "TaxId" : "FE:SSN" }'
+      type: string
+      title: Sensitive Fields
+      description: 'Sensitive fields in the API response as a JSON object (e.g. { "Name" : "FE:PersonName", "TaxId" : "FE:SSN" })'
+      default: '{ "Name" : "FE:PersonName", "TaxId" : "FE:SSN" }'
       "@rendering":
         "@visibleOn":
           - property: encryptMode
             value: Specify Sensitive fields
     filterMode:
       type: string
-      title: Filter Rule
+      title: 2. Message Filter Configuration
       description: >-
         Choose Include or Exclude filter.
         Include filter will only include the matching message in the response, all others will be filtered out.
@@ -105,9 +83,33 @@ spec:
         "@visibleOn":
           - property: filterMode
             value: Exclude
+    dataCryptService:
+      type: string
+      format: service
+      title: 3. DataBlind Service URI
+      description: Base URI of the DataBlind API service, including the API Gateway stage (e.g. .../Dev or /Prod).
+      default: "https://kwoz0lfnn8.execute-api.us-west-1.amazonaws.com/Dev"
+    dataCryptApiKey:
+      type: string
+      title: 4. DataBlind Service Key
+      description: API key will be sent as the x-api-key header when calling the DataBlind API service
+      default: "Please contact mulesoftconnector@ztensor.com"
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    dataBlindKey:
+      type: string
+      format: dataweave
+      title: 5. DataBlind Key
+      description: Encryption Key used by the DataBlind
+      default: "#['1234567812345678']"
+      "@context":
+        "@characteristics":
+          - security:sensitive
     tweak:
       type: string
       format: dataweave
+      title: 6. Tweak
       description: Payload Field to be used as Encryption Tweak
       default: "#[payload.Id default '12345678']"
       bindings:
@@ -117,16 +119,19 @@ spec:
     eligibleHttpCodes:
       type: string
       format: dataweave
+      title: 7. Eligible HTTP Codes
       description: Apply Datablind only when the API response has the following HTTP Codes
       default: "#['200,201,202,205,213']"
     dataBlindToken:
       type: string
       format: dataweave
+      title: 8. DataBlind Token
       description: When a valid override token is provided, Datablind returns the unencrypted and unmasked data
       default: "#[attributes.headers['dataBlindToken']]"
     dataBlindPassphrase:
       type: string
       format: dataweave
+      title: 9. DataBlind Passphrase
       description: When a valid override token passphrase is provided, Datablind returns the unencrypted and unmasked data
       default: "#[attributes.headers['dataBlindPassphrase']]"
   required:
