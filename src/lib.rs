@@ -511,10 +511,37 @@ fn is_datacrypt_error(token: &str) -> bool {
         .unwrap_or(false)
 }
 
+const DATACRYPT_ERROR_PREFIX: &str = "ZTensor DataBlind ";
+
+/// Prefixes DataCrypt's `{"error": "..."}` responses with "ZTensor DataBlind " so error
+/// messages surfaced to the client are consistently branded. Non-error tokens pass through
+/// unchanged.
+fn brand_datacrypt_error(token: &str) -> String {
+    if !is_datacrypt_error(token) {
+        return token.to_string();
+    }
+
+    let Ok(mut value) = serde_json::from_str::<Value>(token) else {
+        return token.to_string();
+    };
+
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        if !error.starts_with(DATACRYPT_ERROR_PREFIX) {
+            value["error"] = Value::String(format!("{DATACRYPT_ERROR_PREFIX}{error}"));
+        }
+    }
+
+    serde_json::to_string(&value).unwrap_or_else(|_| token.to_string())
+}
+
+// Kept for the commented-out sensitive-payload log call sites above; not currently invoked.
+#[allow(dead_code)]
 fn log_datacrypt_response(operation: &str, token: &str) {
     logger::info!("{LOG_LABEL}{operation} response JSON: {token}");
 }
 
+// Kept for the commented-out sensitive-payload log call sites above; not currently invoked.
+#[allow(dead_code)]
 fn log_message(label: &str, bytes: impl AsRef<[u8]>) {
     logger::info!(
         "{LOG_LABEL}{label}: {}",
@@ -677,6 +704,23 @@ fn warn_if_api_key_missing(label: &str, key: Option<&str>) {
     );
 }
 
+/// Replaces the response body with a generic ZTensor DataBlind error. Used as the fail-closed
+/// path: when filtering/encryption was configured but couldn't be completed (parse failure or a
+/// failed DataCrypt call), we block the response instead of letting the original, unprotected
+/// upstream payload reach the client.
+fn block_unprotected_response(headers_body_handler: &dyn HeadersBodyHandler, reason: &str) {
+    let body = serde_json::json!({ "error": format!("{DATACRYPT_ERROR_PREFIX}{reason}") });
+    let body_bytes = serde_json::to_vec(&body)
+        .unwrap_or_else(|_| b"{\"error\":\"ZTensor DataBlind response blocked\"}".to_vec());
+
+    match headers_body_handler.set_body(&body_bytes) {
+        Ok(_) => logger::warn!("{LOG_LABEL}DataBlind fail-safe: response blocked ({reason})"),
+        Err(err) => logger::warn!(
+            "{LOG_LABEL}DataBlind fail-safe: unable to block response ({reason}): {err:?}"
+        ),
+    }
+}
+
 /// Reads override credentials and trace context from the inbound request so they are available
 /// when the upstream response is processed.
 async fn request_filter(state: RequestState, config: &RuntimeConfig) -> Flow<RequestContext> {
@@ -703,8 +747,9 @@ async fn request_filter(state: RequestState, config: &RuntimeConfig) -> Flow<Req
     // TEMP(testing): logging raw secret value — remove before release.
     // logger::info!("{LOG_LABEL}Resolved dataBlindPassphrase: {passphrase}");
 
-    let body_state = headers_state.into_body_state().await;
-    log_message("Inbound message", body_state.handler().body());
+    let _body_state = headers_state.into_body_state().await;
+    // Sensitive: logs the raw inbound request body verbatim.
+    // log_message("Inbound message", body_state.handler().body());
 
     Flow::Continue(RequestContext {
         token,
@@ -761,7 +806,8 @@ async fn response_filter(
     let headers_body_state = headers_state.into_headers_body_state().await;
     let headers_body_handler = headers_body_state.handler();
     let payload_bytes = headers_body_handler.body();
-    log_message("Outbound message (upstream)", &payload_bytes);
+    // Sensitive: logs the raw upstream response body (pre-protection) verbatim.
+    // log_message("Outbound message (upstream)", &payload_bytes);
 
     let credentials = request_context;
     let mut dictum = DictumSummary::default();
@@ -786,6 +832,12 @@ async fn response_filter(
         .unwrap_or_default();
     // logger::info!("{LOG_LABEL}Resolved tweak: {tweak}");
 
+    // Computed up front so both failure points below know whether protection was actually
+    // configured, and therefore whether a failure should block the response (fail-closed) or
+    // simply pass it through unchanged (nothing was requested).
+    let filter_rule = build_filter_rule(config);
+    let protection_requested = filter_rule.is_some() || config.encrypt_mode != EncryptMode::None;
+
     // Parse the MCP envelope and extract result.content[0].text for the DataCrypt pipeline.
     let mut mcp_envelope = normalize_data_for_datacrypt(parse_response_json(&payload_bytes));
     let mut datacrypt_data = match extract_mcp_content_text(&mcp_envelope) {
@@ -798,6 +850,12 @@ async fn response_filter(
         }
         Err(err) => {
             logger::warn!("{LOG_LABEL}Unable to parse MCP result.content[0].text: {err}");
+            if protection_requested {
+                block_unprotected_response(
+                    headers_body_handler,
+                    "upstream response could not be parsed as an MCP envelope",
+                );
+            }
             return;
         }
     };
@@ -811,7 +869,7 @@ async fn response_filter(
     let mut final_token: Option<String> = None;
 
     // Step 1: optional filtering (replaces the zt:filter-json operation).
-    if let Some(filter_rule) = build_filter_rule(config) {
+    if let Some(filter_rule) = filter_rule {
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: None,
@@ -833,8 +891,10 @@ async fn response_filter(
         .await
         {
             Ok(token) => {
+                let token = brand_datacrypt_error(&token);
                 dictum.record_action("filter");
-                log_datacrypt_response("filterRule", &token);
+                // Sensitive: logs the filtered-but-not-yet-encrypted plaintext response.
+                // log_datacrypt_response("filterRule", &token);
                 datacrypt_data = datacrypt_data_from_token(&token);
                 if is_datacrypt_error(&token) {
                     logger::warn!("{LOG_LABEL}filterRule returned error: {token}");
@@ -890,11 +950,15 @@ async fn response_filter(
             .await
             {
                 Ok(token) => {
+                    let token = brand_datacrypt_error(&token);
                     dictum.record_action("datacrypt");
                     if is_datacrypt_error(&token) {
                         logger::warn!("{LOG_LABEL}encrypt-json returned error: {token}");
                     } else {
-                        log_datacrypt_response("encrypt-json", &token);
+                        // Sensitive: logs the encrypt-json response verbatim. Not guaranteed
+                        // to be safe — if the configured sensitive fields don't match the
+                        // payload's actual field names, this token is unmasked plaintext.
+                        // log_datacrypt_response("encrypt-json", &token);
                     }
                     final_token = Some(token);
                 }
@@ -932,11 +996,15 @@ async fn response_filter(
             .await
             {
                 Ok(token) => {
+                    let token = brand_datacrypt_error(&token);
                     dictum.record_action("datacrypt-nlp");
                     if is_datacrypt_error(&token) {
                         logger::warn!("{LOG_LABEL}AI redaction returned error: {token}");
                     } else {
-                        log_datacrypt_response("datacrypt-nlp", &token);
+                        // Sensitive: logs the datacrypt-nlp response verbatim. Not guaranteed
+                        // to be safe — if NLP redaction doesn't catch every sensitive field,
+                        // this token can contain unmasked plaintext.
+                        // log_datacrypt_response("datacrypt-nlp", &token);
                     }
                     final_token = Some(token);
                 }
@@ -953,9 +1021,11 @@ async fn response_filter(
     });
 
     if let Some(out) = response_body {
-        logger::info!(
-            "{LOG_LABEL}Outbound message (protected): {out}"
-        );
+        // Sensitive: logs the full outbound response body, which is plaintext whenever
+        // encryption was skipped (filter-only or encryptMode None).
+        // logger::info!(
+        //     "{LOG_LABEL}Outbound message (protected): {out}"
+        // );
         logger::info!(
             "{LOG_LABEL}Setting response body ({} bytes)",
             out.len()
@@ -964,9 +1034,17 @@ async fn response_filter(
             Ok(_) => logger::info!("{LOG_LABEL}DataBlind encryption completed"),
             Err(err) => logger::warn!("{LOG_LABEL}Unable to set response body: {err:?}"),
         }
+    } else if protection_requested {
+        // Fail closed: filtering/encryption was configured but no protected output was
+        // produced (a DataCrypt call failed) — block rather than let the unprotected
+        // upstream payload reach the client.
+        block_unprotected_response(
+            headers_body_handler,
+            "DataBlind was unable to produce a protected response",
+        );
     } else {
-        logger::warn!(
-            "{LOG_LABEL}No DataBlind output produced; upstream response body left unchanged"
+        logger::info!(
+            "{LOG_LABEL}No DataBlind processing configured; upstream response body left unchanged"
         );
     }
 
