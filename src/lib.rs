@@ -153,9 +153,16 @@ struct DataCryptResponse {
     token: String,
 }
 
-/// Builds the filter rule JSON sent to DataCrypt from the Filter Rule UI fields (filterMode plus
-/// the include/exclude field+value pairs). Returns `None` (skip the filter step) when the mode is
-/// "None"/unset or when the field for the selected mode is blank.
+/// Builds the filter rule JSON sent to DataCrypt from the Filter Rule UI fields. Emits the
+/// conditions-based shape the DataCrypt filter API supports:
+///
+/// ```json
+/// { "filter": "exclude", "operator": "OR", "conditions": { "status": "inactive", ... } }
+/// ```
+///
+/// The `conditions` object is assembled from the repeatable Filter Conditions list (each entry has a
+/// field, match type, and value). Returns `None` (skip the filter step) when the mode is
+/// "None"/unset or when no usable conditions are configured.
 fn build_filter_rule(config: &RuntimeConfig) -> Option<Value> {
     // Normalize to lowercase so the emitted rule always uses "include"/"exclude" (what DataCrypt
     // expects), regardless of how the mode is cased in the UI enum. Any mode other than
@@ -165,36 +172,127 @@ fn build_filter_rule(config: &RuntimeConfig) -> Option<Value> {
         .as_deref()
         .unwrap_or("none")
         .to_lowercase();
-    let (field, value) = match mode.as_str() {
-        "include" => (config.include_field.as_deref(), config.include_value.as_deref()),
-        "exclude" => (config.exclude_field.as_deref(), config.exclude_value.as_deref()),
-        _ => return None,
+    if mode != "include" && mode != "exclude" {
+        return None;
+    }
+
+    let conditions = build_filter_conditions(config);
+    if conditions.is_empty() {
+        return None;
+    }
+
+    let operator = normalize_filter_operator(config.filter_operator.as_deref());
+
+    let mut rule = serde_json::Map::new();
+    rule.insert("filter".to_string(), Value::String(mode));
+    rule.insert("operator".to_string(), Value::String(operator.to_string()));
+    rule.insert("conditions".to_string(), Value::Object(conditions));
+    Some(Value::Object(rule))
+}
+
+/// Normalizes the configured operator to the "OR"/"AND" tokens DataCrypt expects, defaulting to
+/// "OR" when unset or unrecognized.
+fn normalize_filter_operator(operator: Option<&str>) -> &'static str {
+    match operator
+        .map(str::trim)
+        .filter(|op| !op.is_empty())
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("AND") => "AND",
+        _ => "OR",
+    }
+}
+
+/// Assembles the `conditions` object from the repeatable Filter Conditions list. Each entry becomes
+/// one `field -> value` pair:
+/// - A single value is shaped by the entry's match type:
+///   - Simple: the value directly (`"field": "value"`)
+///   - Exact/Regex: `{ "type": "exact|regex", "value": "value" }`
+/// - Multiple (comma-separated) values always emit a plain array (`"field": ["a", "b"]`), which the
+///   DataCrypt filter API matches as "any of". Regex/Exact typing does not apply to arrays, so a
+///   configured Regex match type is ignored (with a warning) when multiple values are given.
+///
+/// Entries with a blank field or blank value are skipped.
+fn build_filter_conditions(config: &RuntimeConfig) -> serde_json::Map<String, Value> {
+    let mut conditions = serde_json::Map::new();
+
+    let items = match config.filter_conditions.as_ref() {
+        Some(items) => items,
+        None => return conditions,
     };
 
-    // Accept the field name with or without surrounding quotes (e.g. person.phone or
-    // "person.phone"), mirroring the value handling below.
-    let field = field
-        .map(|field| field.trim().trim_matches('"'))
-        .filter(|field| !field.is_empty())?;
+    for item in items {
+        // Accept the field name with or without surrounding quotes (e.g. person.phone or
+        // "person.phone").
+        let field = match item
+            .field
+            .as_deref()
+            .map(|field| field.trim().trim_matches('"'))
+            .filter(|field| !field.is_empty())
+        {
+            Some(field) => field,
+            None => continue,
+        };
 
-    let values: Vec<Value> = value
-        .unwrap_or_default()
+        let value = parse_condition_value(item.value.as_deref().unwrap_or_default());
+
+        let match_type = item
+            .match_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|match_type| !match_type.is_empty())
+            .unwrap_or("Simple")
+            .to_ascii_lowercase();
+
+        let condition_value = match value {
+            // No usable value: skip this entry.
+            Value::Null => continue,
+            // Multiple values are an "any of" match, sent as a plain array. Regex/Exact matchers
+            // only apply to a single value, so they are not wrapped here.
+            Value::Array(_) => {
+                if match_type == "regex" {
+                    logger::warn!(
+                        "{LOG_LABEL}filter condition for '{field}' uses Regex with multiple values; \
+                         regex is not supported for arrays, matching any of the listed values instead"
+                    );
+                }
+                value
+            }
+            // Single value: apply the match type.
+            single => match match_type.as_str() {
+                "exact" | "regex" => {
+                    let mut typed = serde_json::Map::new();
+                    typed.insert("type".to_string(), Value::String(match_type));
+                    typed.insert("value".to_string(), single);
+                    Value::Object(typed)
+                }
+                // "simple" (and any unknown type) emits the value directly.
+                _ => single,
+            },
+        };
+
+        conditions.insert(field.to_string(), condition_value);
+    }
+
+    conditions
+}
+
+/// Parses a condition value into JSON: a single trimmed string, or an array of strings when the raw
+/// value is a comma-separated list. Returns `Value::Null` when there is no usable value.
+fn parse_condition_value(raw: &str) -> Value {
+    let values: Vec<Value> = raw
         .split(',')
         .map(|value| value.trim().trim_matches('"'))
         .filter(|value| !value.is_empty())
         .map(|value| Value::String(value.to_string()))
         .collect();
 
-    let value = match values.len() {
-        0 => Value::String(String::new()),
+    match values.len() {
+        0 => Value::Null,
         1 => values.into_iter().next().unwrap_or(Value::Null),
         _ => Value::Array(values),
-    };
-
-    let mut rule = serde_json::Map::new();
-    rule.insert("filter".to_string(), Value::String(mode.to_string()));
-    rule.insert(field.to_string(), value);
-    Some(Value::Object(rule))
+    }
 }
 
 /// Parses a configured JSON line: used as-is when it is valid JSON, otherwise treated as a plain
@@ -363,6 +461,37 @@ mod dictum_tests {
     }
 
     #[test]
+    fn normalize_filter_operator_defaults_and_maps() {
+        assert_eq!(normalize_filter_operator(None), "OR");
+        assert_eq!(normalize_filter_operator(Some("")), "OR");
+        assert_eq!(normalize_filter_operator(Some("or")), "OR");
+        assert_eq!(normalize_filter_operator(Some(" And ")), "AND");
+        assert_eq!(normalize_filter_operator(Some("AND")), "AND");
+        assert_eq!(normalize_filter_operator(Some("xor")), "OR");
+    }
+
+    #[test]
+    fn parse_condition_value_handles_single_and_multiple() {
+        assert!(matches!(parse_condition_value(""), Value::Null));
+        assert!(matches!(parse_condition_value("  , "), Value::Null));
+        assert_eq!(
+            parse_condition_value("US"),
+            Value::String("US".to_string())
+        );
+        assert_eq!(
+            parse_condition_value("\"US\""),
+            Value::String("US".to_string())
+        );
+        assert_eq!(
+            parse_condition_value("123, 456"),
+            Value::Array(vec![
+                Value::String("123".to_string()),
+                Value::String("456".to_string()),
+            ])
+        );
+    }
+
+    #[test]
     fn resolve_encrypt_mode_defaults_to_none_for_new_configs() {
         assert_eq!(
             resolve_encrypt_mode(Some("None"), None),
@@ -515,11 +644,17 @@ fn log_datacrypt_response(_operation: &str, _token: &str) {
     // logger::info!("{LOG_LABEL}{operation} response JSON: {token}");
 }
 
-fn log_message(_label: &str, _bytes: impl AsRef<[u8]>) {
-    // logger::info!(
-    //     "{LOG_LABEL}{label}: {}",
-    //     String::from_utf8_lossy(bytes.as_ref())
-    // );
+fn log_message(label: &str, bytes: impl AsRef<[u8]>) {
+    logger::info!(
+        "{LOG_LABEL}{label}: {}",
+        String::from_utf8_lossy(bytes.as_ref())
+    );
+}
+
+/// Whether request/response payloads should be logged. Enabled per environment via the
+/// `debugLogging` config flag (on in lower environments, off in higher environments).
+fn debug_logging_enabled(config: &RuntimeConfig) -> bool {
+    config.debug_logging.unwrap_or(false)
 }
 
 /// Converts a DataCrypt token string into the `data` payload for a follow-on operation.
@@ -618,7 +753,7 @@ async fn call_datacrypt(
     path: &str,
     request: &DataCryptRequest,
     api_key: Option<&str>,
-) -> Result<String> {
+) -> Result<(u32, String)> {
     let request_path = join_service_path(service, path);
     let body = serde_json::to_vec(request)?;
 
@@ -643,9 +778,10 @@ async fn call_datacrypt(
         .map_err(|err| anyhow!("DataCrypt {operation} request to {request_path} failed: {err:?}"))?;
 
     let status = response.status_code();
+    logger::info!("{LOG_LABEL}{operation} HTTP response code: {status}");
     if status == 200 {
         let parsed: DataCryptResponse = serde_json::from_slice(response.body())?;
-        Ok(parsed.token)
+        Ok((status, parsed.token))
     } else {
         Err(anyhow!(
             "DataCrypt {operation} returned status {status} for {request_path}: {}",
@@ -703,8 +839,10 @@ async fn request_filter(state: RequestState, config: &RuntimeConfig) -> Flow<Req
     // TEMP(testing): logging raw secret value — remove before release.
     // logger::info!("{LOG_LABEL}Resolved dataBlindPassphrase: {passphrase}");
 
-    let _body_state = headers_state.into_body_state().await;
-    // log_message("Inbound message", body_state.handler().body());
+    let body_state = headers_state.into_body_state().await;
+    if debug_logging_enabled(config) {
+        log_message("Inbound message", body_state.handler().body());
+    }
 
     Flow::Continue(RequestContext {
         token,
@@ -761,7 +899,9 @@ async fn response_filter(
     let headers_body_state = headers_state.into_headers_body_state().await;
     let headers_body_handler = headers_body_state.handler();
     let payload_bytes = headers_body_handler.body();
-    // log_message("Outbound message (upstream)", &payload_bytes);
+    if debug_logging_enabled(config) {
+        log_message("Outbound message (upstream)", &payload_bytes);
+    }
 
     let credentials = request_context;
     let mut dictum = DictumSummary::default();
@@ -810,8 +950,18 @@ async fn response_filter(
 
     let mut final_token: Option<String> = None;
 
+    // HTTP response codes from each DataCrypt call, collected for later use (logged below for now).
+    let mut filter_status_code: Option<u32> = None;
+    let mut encrypt_status_code: Option<u32> = None;
+    let mut nlp_status_code: Option<u32> = None;
+
     // Step 1: optional filtering (replaces the zt:filter-json operation).
     if let Some(filter_rule) = build_filter_rule(config) {
+        logger::info!(
+            "{LOG_LABEL}filterRule criteria: {}",
+            serde_json::to_string(&filter_rule)
+                .unwrap_or_else(|_| filter_rule.to_string())
+        );
         let request = DataCryptRequest {
             key: key.clone(),
             tweak: None,
@@ -832,7 +982,8 @@ async fn response_filter(
         )
         .await
         {
-            Ok(token) => {
+            Ok((status, token)) => {
+                filter_status_code = Some(status);
                 dictum.record_action("filter");
                 log_datacrypt_response("filterRule", &token);
                 datacrypt_data = datacrypt_data_from_token(&token);
@@ -889,7 +1040,8 @@ async fn response_filter(
             )
             .await
             {
-                Ok(token) => {
+                Ok((status, token)) => {
+                    encrypt_status_code = Some(status);
                     dictum.record_action("datacrypt");
                     if is_datacrypt_error(&token) {
                         logger::warn!("{LOG_LABEL}encrypt-json returned error: {token}");
@@ -931,7 +1083,8 @@ async fn response_filter(
             )
             .await
             {
-                Ok(token) => {
+                Ok((status, token)) => {
+                    nlp_status_code = Some(status);
                     dictum.record_action("datacrypt-nlp");
                     if is_datacrypt_error(&token) {
                         logger::warn!("{LOG_LABEL}AI redaction returned error: {token}");
@@ -945,6 +1098,13 @@ async fn response_filter(
         }
     }
 
+    logger::info!(
+        "{LOG_LABEL}DataCrypt HTTP status codes -> filterRule: {}, encrypt-json: {}, datacrypt-nlp: {}",
+        filter_status_code.map_or_else(|| "not called".to_string(), |code| code.to_string()),
+        encrypt_status_code.map_or_else(|| "not called".to_string(), |code| code.to_string()),
+        nlp_status_code.map_or_else(|| "not called".to_string(), |code| code.to_string()),
+    );
+
     // Step 3: write the protected token back into result.content[0].text and replace the response body.
     let response_body = final_token.and_then(|token| {
         finalize_mcp_response(&mut mcp_envelope, &token)
@@ -953,9 +1113,11 @@ async fn response_filter(
     });
 
     if let Some(out) = response_body {
-        // logger::info!(
-        //     "{LOG_LABEL}Outbound message (protected): {out}"
-        // );
+        if debug_logging_enabled(config) {
+            logger::info!(
+                "{LOG_LABEL}Outbound message (protected): {out}"
+            );
+        }
         logger::info!(
             "{LOG_LABEL}Setting response body ({} bytes)",
             out.len()
@@ -991,6 +1153,15 @@ async fn configure(
         "dataCryptApiKey",
         normalized_api_key(&config.data_crypt_api_key).as_deref(),
     );
+
+    // Loud, alertable warning so an accidental debugLogging=true (e.g. in Prod) is visible in logs
+    // and can be caught by a monitoring alert. Payload logging exposes potentially sensitive data.
+    if debug_logging_enabled(&config) {
+        logger::warn!(
+            "{LOG_LABEL}SECURITY WARNING: debugLogging is ENABLED — request/response payloads will \
+             be logged. Disable this in higher environments (e.g. Prod) to avoid logging sensitive data."
+        );
+    }
 
     let filter = on_request(|rs| request_filter(rs, &config))
         .on_response(|rs, request_data| response_filter(rs, request_data, &config, &client));

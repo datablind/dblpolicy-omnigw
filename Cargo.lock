@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "mcp_datablind"
-version = "1.8.8"
+version = "1.8.14"
 dependencies = [
  "anyhow",
  "flate2",

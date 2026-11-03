@@ -43,46 +43,47 @@ spec:
         - Include
         - Exclude
       default: None
-    includeField:
+    filterOperator:
       type: string
-      title: Include Filter Json Field
+      title: Filter Match Operator
       description: >-
-        e.g. person.phone
-      default: ""
-      "@rendering":
-        "@visibleOn":
-          - property: filterMode
-            value: Include
-    includeValue:
-      type: string
-      title: Include Filter Json Value
+        How multiple filter conditions are combined. OR matches a message when any condition matches; AND matches only when all conditions match.
+      enum:
+        - OR
+        - AND
+      default: OR
+    filterConditions:
+      type: array
+      title: Filter Conditions
       description: >-
-        Include only the following values in the response (e.g. 1234567890, 0987654321).
-      default: ""
-      "@rendering":
-        "@visibleOn":
-          - property: filterMode
-            value: Include
-    excludeField:
-      type: string
-      title: Exclude Filter Json Field
-      description: >-
-        e.g. person.phone
-      default: ""
-      "@rendering":
-        "@visibleOn":
-          - property: filterMode
-            value: Exclude
-    excludeValue:
-      type: string
-      title: Exclude Filter Json Value
-      description: >-
-        Exclude the following values in the response (e.g. 1234567890, 0987654321).
-      default: ""
-      "@rendering":
-        "@visibleOn":
-          - property: filterMode
-            value: Exclude
+        One or more field conditions used for filtering. Each condition has a JSON field path, a
+        match type, and a value. Conditions are combined using the Filter Match Operator (OR/AND).
+      items:
+        type: object
+        properties:
+          field:
+            type: string
+            title: Field
+            description: JSON field path (e.g. person.phone or customer.address.state).
+          matchType:
+            type: string
+            title: Match Type
+            description: >-
+              Applies only to a single value. Simple compares the value directly; Exact and Regex
+              wrap it as { "type": "exact|regex", "value": "..." } for the DataCrypt filter API.
+              Match Type is ignored when multiple (comma-separated) values are provided, since an
+              array is matched as "any of".
+            enum:
+              - Simple
+              - Exact
+              - Regex
+            default: Simple
+          value:
+            type: string
+            title: Value
+            description: >-
+              Value to match. For multiple values, use a comma-separated list (e.g. 123,456); it is
+              sent as an array and matched as "any of" (Regex/Exact do not apply to arrays).
     dataCryptService:
       type: string
       format: service
@@ -134,6 +135,13 @@ spec:
       title: 9. DataBlind Passphrase
       description: When a valid override token passphrase is provided, Datablind returns the unencrypted and unmasked data
       default: "#[attributes.headers['dataBlindPassphrase']]"
+    debugLogging:
+      type: boolean
+      title: 10. Debug Logging (Request/Response Payloads)
+      description: >-
+        Enable in lower environments (e.g. Dev/Test) to log the request and response message
+        payloads. Leave disabled in higher environments (e.g. Prod) to avoid logging sensitive data.
+      default: false
   required:
     - dataBlindKey
     - tweak

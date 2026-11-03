@@ -1,5 +1,14 @@
 use serde::Deserialize;
 #[derive(Deserialize, Clone, Debug)]
+pub struct FilterConditions0Config {
+    #[serde(alias = "field")]
+    pub field: Option<String>,
+    #[serde(alias = "matchType")]
+    pub match_type: Option<String>,
+    #[serde(alias = "value")]
+    pub value: Option<String>,
+}
+#[derive(Deserialize, Clone, Debug)]
 pub struct Config {
     #[serde(alias = "dataBlindKey", deserialize_with = "de_data_blind_key_0")]
     pub data_blind_key: pdk::script::Script,
@@ -17,20 +26,18 @@ pub struct Config {
         deserialize_with = "pdk::serde::deserialize_service"
     )]
     pub data_crypt_service: pdk::hl::Service,
+    #[serde(alias = "debugLogging")]
+    pub debug_logging: Option<bool>,
     #[serde(alias = "eligibleHttpCodes", deserialize_with = "de_eligible_http_codes_3")]
     pub eligible_http_codes: pdk::script::Script,
     #[serde(alias = "encryptMode")]
     pub encrypt_mode: Option<String>,
-    #[serde(alias = "excludeField")]
-    pub exclude_field: Option<String>,
-    #[serde(alias = "excludeValue")]
-    pub exclude_value: Option<String>,
+    #[serde(alias = "filterConditions")]
+    pub filter_conditions: Option<Vec<FilterConditions0Config>>,
     #[serde(alias = "filterMode")]
     pub filter_mode: Option<String>,
-    #[serde(alias = "includeField")]
-    pub include_field: Option<String>,
-    #[serde(alias = "includeValue")]
-    pub include_value: Option<String>,
+    #[serde(alias = "filterOperator")]
+    pub filter_operator: Option<String>,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<String>,
     #[serde(alias = "tweak", deserialize_with = "de_tweak_4")]
