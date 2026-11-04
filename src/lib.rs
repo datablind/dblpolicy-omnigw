@@ -554,6 +554,45 @@ mod dictum_tests {
     fn resolve_encrypt_mode_treats_missing_values_as_none() {
         assert_eq!(resolve_encrypt_mode(None, None), EncryptMode::None);
     }
+
+    fn status_error(status: u32) -> anyhow::Error {
+        DataCryptStatusError {
+            status,
+            detail: "body from the DataBlind service".to_string(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn failure_response_maps_no_response_to_gateway_timeout() {
+        let (status, message) = failure_response(&status_error(0));
+        assert_eq!(status, 504);
+        assert!(message.starts_with("ZTensor DataBlind"));
+        assert!(message.contains("did not respond in time"));
+    }
+
+    #[test]
+    fn failure_response_maps_service_gateway_timeout_to_gateway_timeout() {
+        let (status, message) = failure_response(&status_error(504));
+        assert_eq!(status, 504);
+        assert!(message.contains("did not respond in time"));
+    }
+
+    #[test]
+    fn failure_response_maps_error_status_to_bad_gateway_without_leaking_the_body() {
+        let (status, message) = failure_response(&status_error(403));
+        assert_eq!(status, 502);
+        assert!(message.contains("HTTP 403"));
+        assert!(!message.contains("body from the DataBlind service"));
+    }
+
+    #[test]
+    fn failure_response_maps_other_errors_to_bad_gateway() {
+        let (status, message) = failure_response(&anyhow!("dispatch failed"));
+        assert_eq!(status, 502);
+        assert!(message.contains("could not be reached"));
+        assert!(!message.contains("dispatch failed"));
+    }
 }
 
 /// Parses the upstream response body as JSON when possible.
@@ -783,10 +822,14 @@ async fn call_datacrypt(
         let parsed: DataCryptResponse = serde_json::from_slice(response.body())?;
         Ok((status, parsed.token))
     } else {
-        Err(anyhow!(
-            "DataCrypt {operation} returned status {status} for {request_path}: {}",
-            String::from_utf8_lossy(response.body())
-        ))
+        Err(DataCryptStatusError {
+            status,
+            detail: format!(
+                "DataCrypt {operation} returned status {status} for {request_path}: {}",
+                String::from_utf8_lossy(response.body())
+            ),
+        }
+        .into())
     }
 }
 
@@ -811,6 +854,65 @@ fn warn_if_api_key_missing(label: &str, key: Option<&str>) {
     logger::warn!(
         "{LOG_LABEL}{label} is missing or still set to the placeholder value; DataCrypt calls will return 403 Forbidden until a valid x-api-key is configured in API Manager"
     );
+}
+
+/// A DataCrypt call that did not return HTTP 200. A status of 0 means no response was received
+/// at all (e.g. the call timed out).
+#[derive(Debug)]
+struct DataCryptStatusError {
+    status: u32,
+    detail: String,
+}
+
+impl std::fmt::Display for DataCryptStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for DataCryptStatusError {}
+
+const FAILURE_MESSAGE_PREFIX: &str =
+    "ZTensor DataBlind was unable to protect this response because the DataBlind service ";
+
+/// The HTTP status and message sent to the client when a DataCrypt call fails. The message never
+/// includes the DataCrypt response body or any response data.
+fn failure_response(err: &anyhow::Error) -> (u32, String) {
+    match err.downcast_ref::<DataCryptStatusError>() {
+        // 0 = no response at all; 504 = the DataBlind service's own gateway timed out.
+        Some(failure) if failure.status == 0 || failure.status == 504 => (
+            504,
+            format!("{FAILURE_MESSAGE_PREFIX}did not respond in time. Please try again."),
+        ),
+        Some(failure) => (
+            502,
+            format!(
+                "{FAILURE_MESSAGE_PREFIX}returned an error (HTTP {}).",
+                failure.status
+            ),
+        ),
+        None => (
+            502,
+            format!("{FAILURE_MESSAGE_PREFIX}could not be reached or returned an invalid reply."),
+        ),
+    }
+}
+
+/// Fail-closed path: replaces the response body with a generic DataBlind error and sets the
+/// failure status, so the unprotected upstream payload never reaches the client.
+fn block_unprotected_response(handler: &dyn HeadersBodyHandler, err: &anyhow::Error) {
+    let (status, message) = failure_response(err);
+    let body = serde_json::json!({ "error": message }).to_string();
+
+    handler.set_header(":status", &status.to_string());
+    match handler.set_body(body.as_bytes()) {
+        Ok(_) => {
+            logger::warn!("{LOG_LABEL}DataBlind fail-safe: response blocked with status {status}")
+        }
+        Err(set_err) => logger::warn!(
+            "{LOG_LABEL}DataBlind fail-safe: unable to replace response body: {set_err:?}"
+        ),
+    }
 }
 
 /// Reads override credentials and trace context from the inbound request so they are available
@@ -998,7 +1100,11 @@ async fn response_filter(
                     describe_data_for_log(&datacrypt_data)
                 );
             }
-            Err(err) => logger::warn!("{LOG_LABEL}filterRule call failed: {err}"),
+            Err(err) => {
+                logger::warn!("{LOG_LABEL}filterRule call failed: {err}");
+                block_unprotected_response(headers_body_handler, &err);
+                return;
+            }
         }
     }
 
@@ -1050,7 +1156,11 @@ async fn response_filter(
                     }
                     final_token = Some(token);
                 }
-                Err(err) => logger::warn!("{LOG_LABEL}encrypt-json call failed: {err}"),
+                Err(err) => {
+                    logger::warn!("{LOG_LABEL}encrypt-json call failed: {err}");
+                    block_unprotected_response(headers_body_handler, &err);
+                    return;
+                }
             }
         }
         EncryptMode::DetermineFieldsUsingNlp => {
@@ -1093,7 +1203,11 @@ async fn response_filter(
                     }
                     final_token = Some(token);
                 }
-                Err(err) => logger::warn!("{LOG_LABEL}AI redaction call failed: {err}"),
+                Err(err) => {
+                    logger::warn!("{LOG_LABEL}AI redaction call failed: {err}");
+                    block_unprotected_response(headers_body_handler, &err);
+                    return;
+                }
             }
         }
     }
