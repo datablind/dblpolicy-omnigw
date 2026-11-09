@@ -924,11 +924,18 @@ async fn response_filter(
     let data_crypt_api_key = normalized_api_key(&config.data_crypt_api_key);
     warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
+    // Legacy mode: the key is configured directly. (dataBlindKey is optional now; an
+    // unset value behaves like an empty key, exactly as an unevaluable one always did.)
     let key: String = config
         .data_blind_key
-        .evaluator()
-        .eval()
-        .and_then(TryFromValue::try_from_value)
+        .as_ref()
+        .map(|script| {
+            script
+                .evaluator()
+                .eval()
+                .and_then(TryFromValue::try_from_value)
+                .unwrap_or_default()
+        })
         .unwrap_or_default();
     // TEMP(testing): logging raw secret value — remove before release.
     // logger::info!("{LOG_LABEL}Resolved dataBlindKey: {key}");

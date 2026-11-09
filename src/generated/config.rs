@@ -10,8 +10,8 @@ pub struct FilterConditions0Config {
 }
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
-    #[serde(alias = "dataBlindKey", deserialize_with = "de_data_blind_key_0")]
-    pub data_blind_key: pdk::script::Script,
+    #[serde(alias = "dataBlindKey", default, deserialize_with = "de_data_blind_key_0")]
+    pub data_blind_key: Option<pdk::script::Script>,
     #[serde(
         alias = "dataBlindPassphrase",
         deserialize_with = "de_data_blind_passphrase_1"
@@ -38,6 +38,16 @@ pub struct Config {
     pub filter_mode: Option<String>,
     #[serde(alias = "filterOperator")]
     pub filter_operator: Option<String>,
+    #[serde(alias = "keyId")]
+    pub key_id: Option<String>,
+    #[serde(
+        alias = "keyServiceUrl",
+        default,
+        deserialize_with = "pdk::serde::deserialize_service_opt"
+    )]
+    pub key_service_url: Option<pdk::hl::Service>,
+    #[serde(alias = "policyAccessKey")]
+    pub policy_access_key: Option<String>,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<String>,
     #[serde(alias = "tweak", deserialize_with = "de_tweak_4")]
@@ -53,21 +63,30 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
             )
         })?;
     abi.service_create(config.data_crypt_service)?;
+    if config.key_service_url.is_some() {
+        let service = config.key_service_url.unwrap();
+        abi.service_create(service)?;
+    }
     abi.setup()?;
     Ok(())
 }
-fn de_data_blind_key_0<'de, D>(deserializer: D) -> Result<pdk::script::Script, D::Error>
+fn de_data_blind_key_0<'de, D>(
+    deserializer: D,
+) -> Result<Option<pdk::script::Script>, D::Error>
 where
     D: serde::de::Deserializer<'de>,
 {
-    let exp: pdk::script::Expression = serde::de::Deserialize::deserialize(
+    let exp: Option<pdk::script::Expression> = serde::de::Deserialize::deserialize(
         deserializer,
     )?;
-    pdk::script::ScriptingEngine::script(&exp)
-        .input(pdk::script::Input::Attributes)
-        .input(pdk::script::Input::Payload(pdk::script::Format::PlainText))
-        .compile()
-        .map_err(serde::de::Error::custom)
+    exp.map(|exp| {
+            pdk::script::ScriptingEngine::script(&exp)
+                .input(pdk::script::Input::Attributes)
+                .input(pdk::script::Input::Payload(pdk::script::Format::PlainText))
+                .compile()
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
 }
 fn de_data_blind_passphrase_1<'de, D>(
     deserializer: D,
