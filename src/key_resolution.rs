@@ -148,35 +148,23 @@ pub fn decode_cache_entry(bytes: &[u8], key_id: &str, now_ms: u64) -> Option<Str
     (now_ms < entry.expires_at_ms && !entry.key.trim().is_empty()).then_some(entry.key)
 }
 
-/// Startup validation. An empty `key_id` means legacy mode (always valid). The
-/// error text names the field and never repeats a configured value.
-pub fn validate_mode_config(key_id: &str, service_present: bool, access_key: &str) -> Result<(), String> {
+/// Startup validation. The key service URL is required by the policy definition,
+/// so only the two text settings are checked here. The error text names the field
+/// and never repeats a configured value.
+pub fn validate_key_config(key_id: &str, access_key: &str) -> Result<(), String> {
     let key_id = key_id.trim();
     if key_id.is_empty() {
-        return Ok(());
+        return Err("keyId is required (the DataBlind app zone GUID)".to_string());
     }
     if !is_uuid(key_id) {
         return Err("keyId must be a UUID (the DataBlind app zone GUID)".to_string());
     }
-    if !service_present {
-        return Err("keyServiceUrl is required when keyId is set".to_string());
-    }
     let access_key = access_key.trim();
     if access_key.is_empty() {
-        return Err("policyAccessKey is required when keyId is set".to_string());
+        return Err("policyAccessKey is required".to_string());
     }
     if !access_key.starts_with(POLICY_ACCESS_KEY_PREFIX) {
         return Err("policyAccessKey is not a DataBlind policy access key".to_string());
-    }
-    Ok(())
-}
-
-/// A policy must say where its key comes from: the configured DataBlind Key
-/// (legacy) or a Key ID (key-resolution mode). Neither would silently run with
-/// an empty key, so it is refused at startup. If both are set, the Key ID wins.
-pub fn validate_key_source(key_id: &str, legacy_key_present: bool) -> Result<(), String> {
-    if key_id.trim().is_empty() && !legacy_key_present {
-        return Err("configure either DataBlind Key (5) or DataBlind Key ID (5a)".to_string());
     }
     Ok(())
 }
@@ -463,50 +451,33 @@ mod tests {
     // ---- startup validation ----
 
     #[test]
-    fn mode_config_empty_key_id_is_legacy_mode_and_always_valid() {
-        assert_eq!(validate_mode_config("", false, ""), Ok(()));
-        assert_eq!(validate_mode_config("   ", false, ""), Ok(()));
+    fn key_config_valid() {
+        assert_eq!(validate_key_config(GUID, ACCESS_KEY), Ok(()));
     }
 
     #[test]
-    fn mode_config_valid_resolution_config() {
-        assert_eq!(validate_mode_config(GUID, true, ACCESS_KEY), Ok(()));
+    fn key_config_rejects_each_missing_or_malformed_part() {
+        assert!(validate_key_config("", ACCESS_KEY).is_err());
+        assert!(validate_key_config("   ", ACCESS_KEY).is_err());
+        assert!(validate_key_config("not-a-uuid", ACCESS_KEY).is_err());
+        assert!(validate_key_config(GUID, "").is_err());
+        assert!(validate_key_config(GUID, "   ").is_err());
+        assert!(validate_key_config(GUID, "not-a-policy-key").is_err());
     }
 
     #[test]
-    fn mode_config_rejects_each_missing_or_malformed_part() {
-        assert!(validate_mode_config("not-a-uuid", true, ACCESS_KEY).is_err());
-        assert!(validate_mode_config(GUID, false, ACCESS_KEY).is_err());
-        assert!(validate_mode_config(GUID, true, "").is_err());
-        assert!(validate_mode_config(GUID, true, "   ").is_err());
-        assert!(validate_mode_config(GUID, true, "not-a-policy-key").is_err());
-    }
-
-    #[test]
-    fn mode_config_errors_never_repeat_configured_values() {
+    fn key_config_errors_never_repeat_configured_values() {
         let secret_key_id = "secret-looking-key-id";
         let secret_access = "secret-looking-access-key";
         for result in [
-            validate_mode_config(secret_key_id, true, ACCESS_KEY),
-            validate_mode_config(GUID, true, secret_access),
-            validate_mode_config(GUID, false, secret_access),
+            validate_key_config(secret_key_id, ACCESS_KEY),
+            validate_key_config(GUID, secret_access),
         ] {
             let message = result.unwrap_err();
             assert!(!message.contains(secret_key_id), "{}", message);
             assert!(!message.contains(secret_access), "{}", message);
             assert!(!message.contains(ACCESS_KEY), "{}", message);
         }
-    }
-
-    // ---- key source ----
-
-    #[test]
-    fn key_source_needs_a_legacy_key_or_a_key_id() {
-        assert!(validate_key_source("", false).is_err());
-        assert!(validate_key_source("   ", false).is_err());
-        assert!(validate_key_source("", true).is_ok());
-        assert!(validate_key_source(GUID, false).is_ok());
-        assert!(validate_key_source(GUID, true).is_ok());
     }
 
     // ---- plan ----

@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::generated::config::Config as GeneratedConfig;
 use crate::key_resolution::{
     decode_cache_entry, encode_cache_entry, needs_workload_check, parse_resolve_response, plan,
-    validate_key_source, validate_mode_config, workload_guid_from_passphrase, Credentials, Plan,
+    validate_key_config, workload_guid_from_passphrase, Credentials, Plan,
     ResolveFailure, ResolveRequest, ResolveResponse,
 };
 
@@ -847,26 +847,20 @@ fn block_unprotected_response(handler: &dyn HeadersBodyHandler) {
 
 /// Where the DataBlind key comes from for this policy instance.
 enum KeyMode<'a> {
-    /// dataBlindKey is configured directly (the original behaviour, unchanged).
-    Legacy,
     /// The key is fetched from datablindcp with a policy access key.
     Resolved { key_id: &'a str, service: &'a Service, access_key: &'a str },
-    /// keyId is set but the rest is missing. Startup validation prevents this; if it
-    /// ever happened the response is blocked rather than falling back to another key.
+    /// The key ID or access key is blank. Startup validation prevents this; if it
+    /// ever happened the response is blocked rather than encrypting with some other key.
     Misconfigured,
 }
 
 fn key_mode(config: &RuntimeConfig) -> KeyMode<'_> {
-    let key_id = config.key_id.as_deref().map(str::trim).unwrap_or("");
-    if key_id.is_empty() {
-        return KeyMode::Legacy;
+    let key_id = config.key_id.trim();
+    let access_key = config.policy_access_key.trim();
+    if key_id.is_empty() || access_key.is_empty() {
+        return KeyMode::Misconfigured;
     }
-    match (&config.key_service_url, config.policy_access_key.as_deref().map(str::trim)) {
-        (Some(service), Some(access_key)) if !access_key.is_empty() => {
-            KeyMode::Resolved { key_id, service, access_key }
-        }
-        _ => KeyMode::Misconfigured,
-    }
+    KeyMode::Resolved { key_id, service: &config.key_service_url, access_key }
 }
 
 /// Milliseconds since the Unix epoch, or None if the clock is unusable (then the
@@ -1057,21 +1051,8 @@ async fn response_filter(
     warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
     let key: String = match key_mode(config) {
-        // Legacy mode: the key is configured directly. (dataBlindKey is optional now; an
-        // unset value behaves like an empty key, exactly as an unevaluable one always did.)
-        KeyMode::Legacy => config
-            .data_blind_key
-            .as_ref()
-            .map(|script| {
-                script
-                    .evaluator()
-                    .eval()
-                    .and_then(TryFromValue::try_from_value)
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default(),
         KeyMode::Misconfigured => {
-            logger::error!("{LOG_LABEL}Key resolution is only partly configured; blocking the response");
+            logger::error!("{LOG_LABEL}Key resolution is not fully configured; blocking the response");
             block_unprotected_response(headers_body_handler);
             return;
         }
@@ -1341,15 +1322,7 @@ async fn configure(
 
     // Refuse to start on a configuration that cannot work or could fall back to the
     // wrong key. The messages name the setting, never its value.
-    let key_id = config.key_id.as_deref().unwrap_or("");
-    validate_key_source(key_id, config.data_blind_key.is_some())
-        .and_then(|_| {
-            validate_mode_config(
-                key_id,
-                config.key_service_url.is_some(),
-                config.policy_access_key.as_deref().unwrap_or(""),
-            )
-        })
+    validate_key_config(&config.key_id, &config.policy_access_key)
         .map_err(|message| anyhow!("Invalid DataBlind key configuration: {message}"))?;
 
     // One in-memory cache per policy instance; it only ever holds the fetched key.

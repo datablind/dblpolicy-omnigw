@@ -10,14 +10,12 @@ pub struct FilterConditions0Config {
 }
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
-    #[serde(alias = "dataBlindKey", default, deserialize_with = "de_data_blind_key_0")]
-    pub data_blind_key: Option<pdk::script::Script>,
     #[serde(
         alias = "dataBlindPassphrase",
-        deserialize_with = "de_data_blind_passphrase_1"
+        deserialize_with = "de_data_blind_passphrase_0"
     )]
     pub data_blind_passphrase: pdk::script::Script,
-    #[serde(alias = "dataBlindToken", deserialize_with = "de_data_blind_token_2")]
+    #[serde(alias = "dataBlindToken", deserialize_with = "de_data_blind_token_1")]
     pub data_blind_token: pdk::script::Script,
     #[serde(alias = "dataCryptApiKey")]
     pub data_crypt_api_key: String,
@@ -28,7 +26,7 @@ pub struct Config {
     pub data_crypt_service: pdk::hl::Service,
     #[serde(alias = "debugLogging")]
     pub debug_logging: Option<bool>,
-    #[serde(alias = "eligibleHttpCodes", deserialize_with = "de_eligible_http_codes_3")]
+    #[serde(alias = "eligibleHttpCodes", deserialize_with = "de_eligible_http_codes_2")]
     pub eligible_http_codes: pdk::script::Script,
     #[serde(alias = "encryptMode")]
     pub encrypt_mode: Option<String>,
@@ -39,18 +37,17 @@ pub struct Config {
     #[serde(alias = "filterOperator")]
     pub filter_operator: Option<String>,
     #[serde(alias = "keyId")]
-    pub key_id: Option<String>,
+    pub key_id: String,
     #[serde(
         alias = "keyServiceUrl",
-        default,
-        deserialize_with = "pdk::serde::deserialize_service_opt"
+        deserialize_with = "pdk::serde::deserialize_service"
     )]
-    pub key_service_url: Option<pdk::hl::Service>,
+    pub key_service_url: pdk::hl::Service,
     #[serde(alias = "policyAccessKey")]
-    pub policy_access_key: Option<String>,
+    pub policy_access_key: String,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<String>,
-    #[serde(alias = "tweak", deserialize_with = "de_tweak_4")]
+    #[serde(alias = "tweak", deserialize_with = "de_tweak_3")]
     pub tweak: pdk::script::Script,
 }
 #[pdk::hl::entrypoint_flex]
@@ -63,32 +60,11 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
             )
         })?;
     abi.service_create(config.data_crypt_service)?;
-    if config.key_service_url.is_some() {
-        let service = config.key_service_url.unwrap();
-        abi.service_create(service)?;
-    }
+    abi.service_create(config.key_service_url)?;
     abi.setup()?;
     Ok(())
 }
-fn de_data_blind_key_0<'de, D>(
-    deserializer: D,
-) -> Result<Option<pdk::script::Script>, D::Error>
-where
-    D: serde::de::Deserializer<'de>,
-{
-    let exp: Option<pdk::script::Expression> = serde::de::Deserialize::deserialize(
-        deserializer,
-    )?;
-    exp.map(|exp| {
-            pdk::script::ScriptingEngine::script(&exp)
-                .input(pdk::script::Input::Attributes)
-                .input(pdk::script::Input::Payload(pdk::script::Format::PlainText))
-                .compile()
-                .map_err(serde::de::Error::custom)
-        })
-        .transpose()
-}
-fn de_data_blind_passphrase_1<'de, D>(
+fn de_data_blind_passphrase_0<'de, D>(
     deserializer: D,
 ) -> Result<pdk::script::Script, D::Error>
 where
@@ -103,7 +79,7 @@ where
         .compile()
         .map_err(serde::de::Error::custom)
 }
-fn de_data_blind_token_2<'de, D>(
+fn de_data_blind_token_1<'de, D>(
     deserializer: D,
 ) -> Result<pdk::script::Script, D::Error>
 where
@@ -118,7 +94,7 @@ where
         .compile()
         .map_err(serde::de::Error::custom)
 }
-fn de_eligible_http_codes_3<'de, D>(
+fn de_eligible_http_codes_2<'de, D>(
     deserializer: D,
 ) -> Result<pdk::script::Script, D::Error>
 where
@@ -133,7 +109,7 @@ where
         .compile()
         .map_err(serde::de::Error::custom)
 }
-fn de_tweak_4<'de, D>(deserializer: D) -> Result<pdk::script::Script, D::Error>
+fn de_tweak_3<'de, D>(deserializer: D) -> Result<pdk::script::Script, D::Error>
 where
     D: serde::de::Deserializer<'de>,
 {

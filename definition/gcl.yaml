@@ -98,29 +98,20 @@ spec:
       "@context":
         "@characteristics":
           - security:sensitive
-    dataBlindKey:
-      type: string
-      format: dataweave
-      title: 5. DataBlind Key
-      description: Encryption Key used by the DataBlind
-      default: "#['1234567812345678']"
-      "@context":
-        "@characteristics":
-          - security:sensitive
     keyId:
       type: string
-      title: 5a. DataBlind Key ID
+      title: 5. DataBlind Key ID
       description: >-
-        The GUID of the DataBlind app zone. When set, the policy fetches the app zone's key from DataBlind
-        at request time and the DataBlind Key (5) is ignored. Requires 5b and 5c.
+        The GUID of the DataBlind app zone. The policy fetches the app zone's key from DataBlind
+        at request time. Requires 5a and 5b.
     keyServiceUrl:
       type: string
       format: service
-      title: 5b. DataBlind Key Service URI
+      title: 5a. DataBlind Key Service URI
       description: Base URI of the DataBlind control plane functions, e.g. https://<project>.supabase.co/functions/v1
     policyAccessKey:
       type: string
-      title: 5c. Policy Access Key
+      title: 5b. Policy Access Key
       description: Created in DataBlind for the app zone. Sent as the x-policy-access-key header when fetching the key.
       "@context":
         "@characteristics":
@@ -161,6 +152,9 @@ spec:
         payloads. Leave disabled in higher environments (e.g. Prod) to avoid logging sensitive data.
       default: false
   required:
+    - keyId
+    - keyServiceUrl
+    - policyAccessKey
     - tweak
     - eligibleHttpCodes
     - dataBlindToken
