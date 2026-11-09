@@ -1,5 +1,6 @@
 // Copyright 2023 Salesforce, Inc. All rights reserved.
 mod generated;
+mod key_resolution;
 
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
