@@ -161,6 +161,75 @@ pub fn validate_mode_config(key_id: &str, service_present: bool, access_key: &st
     Ok(())
 }
 
+/// A policy must say where its key comes from: the configured DataBlind Key
+/// (legacy) or a Key ID (key-resolution mode). Neither would silently run with
+/// an empty key, so it is refused at startup. If both are set, the Key ID wins.
+pub fn validate_key_source(key_id: &str, legacy_key_present: bool) -> Result<(), String> {
+    if key_id.trim().is_empty() && !legacy_key_present {
+        return Err("configure either DataBlind Key (5) or DataBlind Key ID (5a)".to_string());
+    }
+    Ok(())
+}
+
+/// What the response filter should do once the key (and the credential check)
+/// have been looked up.
+#[derive(PartialEq)]
+pub enum Plan {
+    /// Encrypt with `key`, sending DataCrypt `creds`. `cache_it` says whether the
+    /// key was just fetched fresh and should be (re)stored in the cache.
+    Use { key: String, creds: Credentials, cache_it: bool },
+    /// No key could be obtained: the response must be blocked.
+    Block,
+}
+
+impl fmt::Debug for Plan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Plan::Use { creds, cache_it, .. } => f
+                .debug_struct("Use")
+                .field("key", &"<redacted>")
+                .field("creds", creds)
+                .field("cache_it", cache_it)
+                .finish(),
+            Plan::Block => f.write_str("Block"),
+        }
+    }
+}
+
+/// Decision matrix of key-resolution mode.
+///
+/// * `cached_key`: a still-valid cached key, if any.
+/// * `outcome`: the key service's answer, or `None` when no call was made (a
+///   valid cached key and nothing to check about the caller).
+///
+/// The caller's own override credentials are only ever passed on when the key
+/// service confirmed them (`workload_ok`); in every other case DataCrypt gets
+/// blanks, so the data stays protected. If no key is available at all, block.
+pub fn plan(
+    cached_key: Option<String>,
+    outcome: Option<Result<ResolveResponse, ResolveFailure>>,
+    caller: &Credentials,
+) -> Plan {
+    match outcome {
+        // A fresh answer from the key service.
+        Some(Ok(response)) => {
+            let creds = effective_credentials(&response, caller);
+            Plan::Use { key: response.key, creds, cache_it: true }
+        }
+        // The call failed: a still-valid cached key keeps protection working, but
+        // nothing the caller sent can be trusted, so DataCrypt gets blanks.
+        Some(Err(_)) => match cached_key {
+            Some(key) => Plan::Use { key, creds: Credentials::default(), cache_it: false },
+            None => Plan::Block,
+        },
+        // No call was made: there was nothing to check about the caller.
+        None => match cached_key {
+            Some(key) => Plan::Use { key, creds: Credentials::default(), cache_it: false },
+            None => Plan::Block,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,7 +265,7 @@ mod tests {
             "d3ffbe14-e883-4ce0-907b-035f7fbe8840\n",
             "d3ffbe14-e883-4ce0-907b-035f7fbe884\u{0660}",       // arabic-indic digit, not ASCII hex
         ] {
-            assert!(!is_uuid(bad), "{bad:?} must not be a UUID");
+            assert!(!is_uuid(bad), "{:?} must not be a UUID", bad);
         }
     }
 
@@ -221,7 +290,7 @@ mod tests {
     #[test]
     fn guid_from_passphrase_rejects_missing_or_malformed_prefix() {
         for bad in ["", "nocolon", ":pass", "not-a-uuid:pass", &format!("{GUID}x:pass"), &format!(" {GUID}:pass"), GUID] {
-            assert_eq!(workload_guid_from_passphrase(bad), None, "{bad:?}");
+            assert_eq!(workload_guid_from_passphrase(bad), None, "{:?}", bad);
         }
     }
 
@@ -279,7 +348,8 @@ mod tests {
             assert_eq!(
                 parse_resolve_response(status, br#"{"key":"k","workload_ok":true}"#),
                 Err(ResolveFailure::Rejected(status)),
-                "status {status} must never be treated as success"
+                "status {} must never be treated as success",
+                status
             );
         }
     }
@@ -329,7 +399,7 @@ mod tests {
     fn cache_entry_survives_awkward_keys() {
         for key in ["quote\"inside", "back\\slash", "unicode-é-✓", "new\nline", "a:b|c"] {
             let bytes = encode_cache_entry(key, 5);
-            assert_eq!(decode_cache_entry(&bytes, 6), Some(key.to_string()), "{key:?}");
+            assert_eq!(decode_cache_entry(&bytes, 6), Some(key.to_string()), "{:?}", key);
         }
     }
 
@@ -381,10 +451,107 @@ mod tests {
             validate_mode_config(GUID, false, secret_access),
         ] {
             let message = result.unwrap_err();
-            assert!(!message.contains(secret_key_id), "{message}");
-            assert!(!message.contains(secret_access), "{message}");
-            assert!(!message.contains(ACCESS_KEY), "{message}");
+            assert!(!message.contains(secret_key_id), "{}", message);
+            assert!(!message.contains(secret_access), "{}", message);
+            assert!(!message.contains(ACCESS_KEY), "{}", message);
         }
+    }
+
+    // ---- key source ----
+
+    #[test]
+    fn key_source_needs_a_legacy_key_or_a_key_id() {
+        assert!(validate_key_source("", false).is_err());
+        assert!(validate_key_source("   ", false).is_err());
+        assert!(validate_key_source("", true).is_ok());
+        assert!(validate_key_source(GUID, false).is_ok());
+        assert!(validate_key_source(GUID, true).is_ok());
+    }
+
+    // ---- plan ----
+
+    fn ok(key: &str, workload_ok: bool) -> Option<Result<ResolveResponse, ResolveFailure>> {
+        Some(Ok(ResolveResponse { key: key.to_string(), workload_ok }))
+    }
+
+    fn caller() -> Credentials {
+        creds("caller-token", &format!("{GUID}:caller-pass"))
+    }
+
+    #[test]
+    fn plan_fresh_ok_uses_the_callers_credentials_and_caches_the_key() {
+        assert_eq!(
+            plan(None, ok("fresh-key", true), &caller()),
+            Plan::Use { key: "fresh-key".to_string(), creds: caller(), cache_it: true }
+        );
+    }
+
+    #[test]
+    fn plan_fresh_workload_not_ok_blanks_the_credentials_but_still_caches_the_key() {
+        assert_eq!(
+            plan(None, ok("fresh-key", false), &caller()),
+            Plan::Use { key: "fresh-key".to_string(), creds: Credentials::default(), cache_it: true }
+        );
+    }
+
+    #[test]
+    fn plan_a_fresh_key_replaces_a_stale_cached_one() {
+        assert_eq!(
+            plan(Some("old-key".to_string()), ok("new-key", true), &caller()),
+            Plan::Use { key: "new-key".to_string(), creds: caller(), cache_it: true }
+        );
+    }
+
+    #[test]
+    fn plan_no_call_needed_uses_the_cached_key_with_blank_credentials() {
+        // No token or no GUID prefix: nothing to validate, so nothing is forwarded.
+        assert_eq!(
+            plan(Some("cached-key".to_string()), None, &creds("tok", "no-guid-prefix")),
+            Plan::Use { key: "cached-key".to_string(), creds: Credentials::default(), cache_it: false }
+        );
+    }
+
+    #[test]
+    fn plan_a_failed_call_falls_back_to_the_cached_key_with_blank_credentials() {
+        for failure in [ResolveFailure::Rejected(401), ResolveFailure::Rejected(500), ResolveFailure::Malformed, ResolveFailure::Transport] {
+            assert_eq!(
+                plan(Some("cached-key".to_string()), Some(Err(failure)), &caller()),
+                Plan::Use { key: "cached-key".to_string(), creds: Credentials::default(), cache_it: false }
+            );
+        }
+    }
+
+    #[test]
+    fn plan_a_failed_call_without_a_cached_key_blocks() {
+        for failure in [ResolveFailure::Rejected(401), ResolveFailure::Rejected(409), ResolveFailure::Malformed, ResolveFailure::Transport] {
+            assert_eq!(plan(None, Some(Err(failure)), &caller()), Plan::Block);
+        }
+    }
+
+    #[test]
+    fn plan_without_a_key_and_without_a_call_blocks() {
+        assert_eq!(plan(None, None, &caller()), Plan::Block);
+    }
+
+    #[test]
+    fn plan_never_forwards_the_callers_credentials_unless_the_service_confirmed_them() {
+        let outcomes: Vec<Option<Result<ResolveResponse, ResolveFailure>>> = vec![
+            None,
+            ok("k", false),
+            Some(Err(ResolveFailure::Transport)),
+            Some(Err(ResolveFailure::Rejected(500))),
+        ];
+        for outcome in outcomes {
+            if let Plan::Use { creds, .. } = plan(Some("cached".to_string()), outcome, &caller()) {
+                assert_eq!(creds, Credentials::default());
+            }
+        }
+    }
+
+    #[test]
+    fn plan_debug_output_never_contains_the_key() {
+        let printed = format!("{:?}", plan(None, ok("THE-ZONE-KEY", true), &caller()));
+        assert!(!printed.contains("THE-ZONE-KEY"), "{}", printed);
     }
 
     // ---- request body and Debug redaction ----
@@ -404,7 +571,7 @@ mod tests {
         let caller = creds("THE-TOKEN", "THE-PASSPHRASE");
         let printed = format!("{response:?} {caller:?} {:?}", Some(&caller));
         for secret in ["THE-ZONE-KEY", "THE-TOKEN", "THE-PASSPHRASE"] {
-            assert!(!printed.contains(secret), "{printed}");
+            assert!(!printed.contains(secret), "{}", printed);
         }
     }
 }

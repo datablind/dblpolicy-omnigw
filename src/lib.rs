@@ -4,8 +4,10 @@ mod key_resolution;
 
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
-use std::{io::Read, ops::Deref};
+use std::{io::Read, ops::Deref, time::{Duration, UNIX_EPOCH}};
 
+use pdk::cache::{Cache, CacheBuilder};
+use pdk::hl::timer::Clock;
 use pdk::hl::*;
 use pdk::logger;
 use pdk::script::{HandlerAttributesBinding, TryFromValue};
@@ -13,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generated::config::Config as GeneratedConfig;
+use crate::key_resolution::{
+    decode_cache_entry, encode_cache_entry, needs_workload_check, parse_resolve_response, plan,
+    validate_key_source, validate_mode_config, workload_guid_from_passphrase, Credentials, Plan,
+    ResolveFailure, ResolveRequest, ResolveResponse,
+};
 
 // Policy version is sourced from the `version` field in Cargo.toml at compile time
 // (Cargo exposes it as CARGO_PKG_VERSION), so it never needs manual updating here.
@@ -26,6 +33,13 @@ const DICTUM_HEADER: &str = "DataBlind-Dictum";
 const FILTER_PATH: &str = "/filter";
 const DATACRYPT_PATH: &str = "/datacrypt";
 const NLP_PATH: &str = "/datacrypt-nlp";
+
+// Key-resolution mode (see key_resolution.rs): the key service endpoint appended to
+// keyServiceUrl, how long to wait for it, and where the fetched key is cached.
+const KEY_RESOLVE_PATH: &str = "/app-zone-key-resolve";
+const KEY_SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
+const KEY_CACHE_ID: &str = "datablind-zone-key";
+const KEY_CACHE_ENTRY: &str = "zone-key";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EncryptMode {
@@ -48,20 +62,10 @@ struct RuntimeConfig {
 
 impl RuntimeConfig {
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let inner: GeneratedConfig = serde_json::from_slice(bytes).map_err(|err| {
-            anyhow!(
-                "Failed to parse configuration '{}'. Cause: {}",
-                String::from_utf8_lossy(bytes),
-                err
-            )
-        })?;
-        let compatibility: ConfigCompatibility = serde_json::from_slice(bytes).map_err(|err| {
-            anyhow!(
-                "Failed to parse configuration compatibility '{}'. Cause: {}",
-                String::from_utf8_lossy(bytes),
-                err
-            )
-        })?;
+        let inner: GeneratedConfig =
+            serde_json::from_slice(bytes).map_err(|err| config_parse_error("configuration", &err))?;
+        let compatibility: ConfigCompatibility = serde_json::from_slice(bytes)
+            .map_err(|err| config_parse_error("configuration compatibility", &err))?;
 
         Ok(Self {
             encrypt_mode: resolve_encrypt_mode(
@@ -71,6 +75,18 @@ impl RuntimeConfig {
             inner,
         })
     }
+}
+
+/// A configuration parse failure that never repeats the configuration (it holds
+/// secrets such as policyAccessKey and dataCryptApiKey) or serde's message (which
+/// can echo a mistyped value): only the kind of error and where it is.
+fn config_parse_error(what: &str, err: &serde_json::Error) -> anyhow::Error {
+    anyhow!(
+        "Failed to parse {what}: {:?} error at line {} column {}",
+        err.classify(),
+        err.line(),
+        err.column()
+    )
 }
 
 impl Deref for RuntimeConfig {
@@ -829,6 +845,119 @@ fn block_unprotected_response(handler: &dyn HeadersBodyHandler) {
     }
 }
 
+/// Where the DataBlind key comes from for this policy instance.
+enum KeyMode<'a> {
+    /// dataBlindKey is configured directly (the original behaviour, unchanged).
+    Legacy,
+    /// The key is fetched from datablindcp with a policy access key.
+    Resolved { key_id: &'a str, service: &'a Service, access_key: &'a str },
+    /// keyId is set but the rest is missing. Startup validation prevents this; if it
+    /// ever happened the response is blocked rather than falling back to another key.
+    Misconfigured,
+}
+
+fn key_mode(config: &RuntimeConfig) -> KeyMode<'_> {
+    let key_id = config.key_id.as_deref().map(str::trim).unwrap_or("");
+    if key_id.is_empty() {
+        return KeyMode::Legacy;
+    }
+    match (&config.key_service_url, config.policy_access_key.as_deref().map(str::trim)) {
+        (Some(service), Some(access_key)) if !access_key.is_empty() => {
+            KeyMode::Resolved { key_id, service, access_key }
+        }
+        _ => KeyMode::Misconfigured,
+    }
+}
+
+/// Milliseconds since the Unix epoch, or None if the clock is unusable (then the
+/// key cache is bypassed rather than trusted with a bogus time).
+fn now_millis(clock: &Clock) -> Option<u64> {
+    clock.now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
+}
+
+/// Asks the key service for the app zone key (and, when the caller sent override
+/// credentials, whether they are valid). Logs only status codes: never the key,
+/// the access key, the caller's credentials, or a response body.
+async fn resolve_key(
+    client: &HttpClient,
+    service: &Service,
+    access_key: &str,
+    request: &ResolveRequest<'_>,
+) -> Result<ResolveResponse, ResolveFailure> {
+    let path = join_service_path(service, KEY_RESOLVE_PATH);
+    let body = serde_json::to_vec(request).map_err(|_| ResolveFailure::Malformed)?;
+    let headers: Vec<(&str, &str)> = vec![
+        ("Content-Type", "application/json"),
+        ("x-policy-access-key", access_key),
+    ];
+
+    let response = client
+        .request(service)
+        .path(&path)
+        .headers(headers)
+        .body(&body)
+        .timeout(KEY_SERVICE_TIMEOUT)
+        .post()
+        .await
+        .map_err(|_| {
+            logger::warn!("{LOG_LABEL}Key service request failed (network error or timeout)");
+            ResolveFailure::Transport
+        })?;
+
+    let status = response.status_code();
+    if status != 200 {
+        logger::warn!("{LOG_LABEL}Key service answered with status {status}");
+    }
+    parse_resolve_response(status, response.body())
+}
+
+/// Key-resolution mode: decides which key to use and which override credentials
+/// DataCrypt may see, using the cache where that is safe. The workload/token
+/// verdict is never cached: a request that carries override credentials always
+/// asks the key service, so revocation applies on the very next request.
+async fn plan_resolved_key(
+    client: &HttpClient,
+    cache: &dyn Cache,
+    clock: &Clock,
+    key_id: &str,
+    service: &Service,
+    access_key: &str,
+    caller: &Credentials,
+) -> Plan {
+    let now_ms = now_millis(clock);
+    let cached_key = now_ms
+        .and_then(|now| cache.get(KEY_CACHE_ENTRY).and_then(|bytes| decode_cache_entry(&bytes, now)));
+
+    let check_workload = needs_workload_check(caller);
+    let outcome = if cached_key.is_some() && !check_workload {
+        None
+    } else {
+        let request = ResolveRequest {
+            key_id,
+            workload_guid: if check_workload { workload_guid_from_passphrase(&caller.passphrase) } else { None },
+            override_token: if check_workload { Some(caller.token.as_str()) } else { None },
+        };
+        Some(resolve_key(client, service, access_key, &request).await)
+    };
+
+    let called = outcome.is_some();
+    let decision = plan(cached_key, outcome, caller);
+    if let Plan::Use { key, creds, cache_it } = &decision {
+        logger::info!(
+            "{LOG_LABEL}Key resolution: service_called={called} workload_check_requested={check_workload} override_credentials_forwarded={}",
+            !creds.token.is_empty()
+        );
+        if *cache_it {
+            if let Some(now) = now_ms {
+                if cache.save(KEY_CACHE_ENTRY, encode_cache_entry(key, now)).is_err() {
+                    logger::warn!("{LOG_LABEL}Could not cache the DataBlind key");
+                }
+            }
+        }
+    }
+    decision
+}
+
 /// Reads override credentials and trace context from the inbound request so they are available
 /// when the upstream response is processed.
 async fn request_filter(state: RequestState, config: &RuntimeConfig) -> Flow<RequestContext> {
@@ -873,6 +1002,8 @@ async fn response_filter(
     request_data: RequestData<RequestContext>,
     config: &RuntimeConfig,
     client: &HttpClient,
+    cache: &dyn Cache,
+    clock: &Clock,
 ) {
     let request_context = match request_data {
         RequestData::Continue(context) => context,
@@ -919,25 +1050,51 @@ async fn response_filter(
         log_message("Outbound message (upstream)", &payload_bytes);
     }
 
-    let credentials = request_context;
+    let mut credentials = request_context;
     let mut dictum = DictumSummary::default();
     let field_count = count_sensitive_fields(config);
     let data_crypt_api_key = normalized_api_key(&config.data_crypt_api_key);
     warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
-    // Legacy mode: the key is configured directly. (dataBlindKey is optional now; an
-    // unset value behaves like an empty key, exactly as an unevaluable one always did.)
-    let key: String = config
-        .data_blind_key
-        .as_ref()
-        .map(|script| {
-            script
-                .evaluator()
-                .eval()
-                .and_then(TryFromValue::try_from_value)
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let key: String = match key_mode(config) {
+        // Legacy mode: the key is configured directly. (dataBlindKey is optional now; an
+        // unset value behaves like an empty key, exactly as an unevaluable one always did.)
+        KeyMode::Legacy => config
+            .data_blind_key
+            .as_ref()
+            .map(|script| {
+                script
+                    .evaluator()
+                    .eval()
+                    .and_then(TryFromValue::try_from_value)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default(),
+        KeyMode::Misconfigured => {
+            logger::error!("{LOG_LABEL}Key resolution is only partly configured; blocking the response");
+            block_unprotected_response(headers_body_handler);
+            return;
+        }
+        KeyMode::Resolved { key_id, service, access_key } => {
+            let caller = Credentials {
+                token: credentials.token.clone(),
+                passphrase: credentials.passphrase.clone(),
+            };
+            match plan_resolved_key(client, cache, clock, key_id, service, access_key, &caller).await {
+                Plan::Block => {
+                    logger::warn!("{LOG_LABEL}No DataBlind key is available from the key service; blocking the response");
+                    block_unprotected_response(headers_body_handler);
+                    return;
+                }
+                Plan::Use { key, creds, .. } => {
+                    // DataCrypt only ever sees override credentials the key service confirmed.
+                    credentials.token = creds.token;
+                    credentials.passphrase = creds.passphrase;
+                    key
+                }
+            }
+        }
+    };
     // TEMP(testing): logging raw secret value — remove before release.
     // logger::info!("{LOG_LABEL}Resolved dataBlindKey: {key}");
 
@@ -1177,8 +1334,26 @@ async fn configure(
     launcher: Launcher,
     Configuration(bytes): Configuration,
     client: HttpClient,
+    cache_builder: CacheBuilder,
+    clock: Clock,
 ) -> Result<()> {
     let config = RuntimeConfig::from_bytes(&bytes)?;
+
+    // Refuse to start on a configuration that cannot work or could fall back to the
+    // wrong key. The messages name the setting, never its value.
+    let key_id = config.key_id.as_deref().unwrap_or("");
+    validate_key_source(key_id, config.data_blind_key.is_some())
+        .and_then(|_| {
+            validate_mode_config(
+                key_id,
+                config.key_service_url.is_some(),
+                config.policy_access_key.as_deref().unwrap_or(""),
+            )
+        })
+        .map_err(|message| anyhow!("Invalid DataBlind key configuration: {message}"))?;
+
+    // One in-memory cache per policy instance; it only ever holds the fetched key.
+    let cache = cache_builder.new(KEY_CACHE_ID.to_string()).max_entries(1).build();
 
     // Warn-level so this appears even when policy logging is set to warn in API Manager.
     logger::warn!(
@@ -1199,7 +1374,9 @@ async fn configure(
     }
 
     let filter = on_request(|rs| request_filter(rs, &config))
-        .on_response(|rs, request_data| response_filter(rs, request_data, &config, &client));
+        .on_response(|rs, request_data| {
+        response_filter(rs, request_data, &config, &client, &cache, &clock)
+    });
 
     launcher.launch(filter).await?;
     Ok(())
