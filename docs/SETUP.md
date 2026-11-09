@@ -153,12 +153,39 @@ The policy takes effect on the gateway within a short time. It runs on the **res
 | – | **Filter Conditions** | One or more rows of **Field** (JSON path such as `person.phone`), **Match Type** (`Simple`, `Exact`, `Regex`) and **Value**. Use commas for several values (`123,456`). |
 | 3 | **DataBlind Service URI** | The base URL of the DataBlind service, including the stage, for example `https://…execute-api.us-west-1.amazonaws.com/Dev`. Use the URL you were given. |
 | 4 | **DataBlind Service Key** | The API key for the service (sent as the `x-api-key` header). The placeholder text must be replaced or calls fail with **403 Forbidden**. |
-| 5 | **DataBlind Key** | The encryption key, as a DataWeave expression, for example `#['your-secret-key']`. **Replace the sample default with your own secret.** |
+| 5 | **DataBlind Key** | The encryption key, as a DataWeave expression, for example `#['your-secret-key']`. **Replace the sample default with your own secret.** Ignored when **DataBlind Key ID** (5a) is set. |
+| 5a | **DataBlind Key ID** | Optional. The GUID of the DataBlind app zone. When set, the policy fetches the app zone's key from DataBlind at request time, so the key itself is never stored in the policy. Needs 5b and 5c. See [Key resolution mode](#key-resolution-mode). |
+| 5b | **DataBlind Key Service URI** | The base URL of the DataBlind control plane functions, for example `https://<project>.supabase.co/functions/v1`. |
+| 5c | **Policy Access Key** | The access key created for the app zone in DataBlind (starts with `dbpk_`). Treat it like a password. |
 | 6 | **Tweak** | A value that makes encryption specific to each record, as a DataWeave expression. The default `#[payload.Id default '12345678']` uses the `Id` field of the response. |
 | 7 | **Eligible HTTP Codes** | Only responses with these status codes are protected, for example `#['200,201,202,205,213']`. Other responses pass through untouched. |
 | 8 | **DataBlind Token** | A header that, together with the passphrase, lets a trusted caller receive the original unprotected data. Default: the `dataBlindToken` request header. |
 | 9 | **DataBlind Passphrase** | The matching passphrase. Default: the `dataBlindPassphrase` request header. |
 | 10 | **Debug Logging** | Leave **off**. Turning it on writes request and response contents to the gateway logs, which may include sensitive data. Use it only in development environments. |
+
+---
+
+## Key resolution mode
+
+Instead of pasting the DataBlind key into the policy, you can let the policy fetch it from DataBlind.
+
+**Set up in DataBlind**
+
+1. Open the app zone and note its **GUID** (this is the Key ID). The organization must have *save sensitive data* turned on, so the zone's key is stored.
+2. Register a workload for **DataBlind** in that app zone.
+3. In the App zones list, use the key icon to create a **policy access key** for the zone. It is shown once; copy it.
+4. When you create an override token, choose the app zone **and the workload**. The passphrase you must send is shown as `<workload GUID>:<passphrase>`.
+
+**Set up in the policy**
+
+Fill in **DataBlind Key ID** (5a), **DataBlind Key Service URI** (5b) and **Policy Access Key** (5c). You do not need the DataBlind Key (5) any more. A policy needs either 5 or 5a: with neither, or with a partly filled 5a–5c, it refuses to start.
+
+**What happens on each call**
+
+- The policy asks DataBlind for the key (waiting at most 5 seconds) and keeps it in memory for **60 seconds**. Revoking a policy access key therefore takes effect within about a minute.
+- A caller who sends `dataBlindToken` and a `dataBlindPassphrase` of the form `<workload GUID>:<passphrase>` is checked by DataBlind on **every** request: the token must be active and unexpired and belong to that workload and app zone, and the workload must be active. Only then are the caller's token and passphrase passed on, and the caller gets the unprotected data. Revoking a token or workload takes effect on the next request.
+- If any check fails, or the caller sends no workload GUID, the data is simply returned **protected**. The caller's token and passphrase are not passed on.
+- If DataBlind cannot be reached, a key from the last 60 seconds still keeps data protected (and nobody gets unprotected data). With no key available, the response is blocked with an error instead of leaking data.
 
 ---
 
@@ -194,6 +221,9 @@ If the response is **not** protected, see the troubleshooting table below.
 | Release fails because the version exists | Let the script pick a new version, or set `version` in `Cargo.toml` to an unused one. |
 | **MCP DataBlind** is missing in API Manager | Check Exchange: is it in the same business group as your environment's organization? Check the gateway is version 1.6.1 or newer. |
 | Calls return **403 Forbidden** from DataBlind | The **DataBlind Service Key** is still the placeholder or is wrong. Contact **mulesoftconnector@ztensor.com** for a key. |
+| The policy fails to start after you set **DataBlind Key ID** | Fill in all of 5a, 5b and 5c, make sure 5a is the app zone GUID and 5c is the access key from DataBlind (it starts with `dbpk_`). The error names the missing setting. |
+| Calls return **500** `DataBlind policy failed to apply` in key resolution mode | The policy could not get the key: the access key was revoked or is for another app zone, the zone has no stored key, or DataBlind is unreachable and nothing is cached. Check the gateway log for `Key service answered with status …`. |
+| An override token no longer unprotects data | The token expired or was deactivated, the workload is inactive, or the passphrase is missing the `<workload GUID>:` prefix. |
 | Response is not protected | The response status code is not in **Eligible HTTP Codes**, or **Sensitive Data Encryption** is `None`, or the **Sensitive Fields** names do not match your data. |
 | `make: No rule to make target` | You ran `make` outside the project folder. `cd` into the project and try again. |
 | Build fails with a missing target or `cargo-anypoint` | Run `make setup`, or just run `./release.sh`, which does this when needed. |
@@ -203,6 +233,7 @@ If the response is **not** protected, see the troubleshooting table below.
 ## Keeping it secure
 
 - Keep **Debug Logging** off outside development environments.
-- Treat the **DataBlind Key**, **Service Key**, and Connected App secret like passwords. Do not commit them to git or share them in chat.
+- Treat the **DataBlind Key**, **Policy Access Key**, **Service Key**, and Connected App secret like passwords. Do not commit them to git or share them in chat.
 - Use a Connected App with only the scopes it needs, and rotate its secret if it is ever exposed.
+- Prefer **Key resolution mode**: the key is not stored in the policy, and you can revoke the policy access key at any time without changing the DataBlind key.
 - Choose **For this release only** in `release.sh` when releasing from a shared machine, so no credentials are left behind.
