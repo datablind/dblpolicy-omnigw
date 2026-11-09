@@ -120,19 +120,29 @@ pub fn needs_workload_check(caller: &Credentials) -> bool {
 
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
+    /// The app zone (keyId) this key was fetched for. A policy reconfigured to another
+    /// zone must never reuse the previous zone's key.
+    key_id: String,
     key: String,
     expires_at_ms: u64,
 }
 
-pub fn encode_cache_entry(key: &str, now_ms: u64) -> Vec<u8> {
-    let entry = CacheEntry { key: key.to_string(), expires_at_ms: now_ms.saturating_add(KEY_CACHE_TTL_MS) };
+pub fn encode_cache_entry(key_id: &str, key: &str, now_ms: u64) -> Vec<u8> {
+    let entry = CacheEntry {
+        key_id: key_id.to_string(),
+        key: key.to_string(),
+        expires_at_ms: now_ms.saturating_add(KEY_CACHE_TTL_MS),
+    };
     // A struct of a string and an integer always serializes.
     serde_json::to_vec(&entry).unwrap_or_default()
 }
 
 /// The cached key, unless it has expired or the entry is unusable.
-pub fn decode_cache_entry(bytes: &[u8], now_ms: u64) -> Option<String> {
+pub fn decode_cache_entry(bytes: &[u8], key_id: &str, now_ms: u64) -> Option<String> {
     let entry: CacheEntry = serde_json::from_slice(bytes).ok()?;
+    if entry.key_id != key_id {
+        return None;
+    }
     // An entry that expires "at the end of time" (saturated) is still honoured only
     // while now is strictly before that instant, so u64::MAX is always expired.
     (now_ms < entry.expires_at_ms && !entry.key.trim().is_empty()).then_some(entry.key)
@@ -201,6 +211,8 @@ impl fmt::Debug for Plan {
 /// * `cached_key`: a still-valid cached key, if any.
 /// * `outcome`: the key service's answer, or `None` when no call was made (a
 ///   valid cached key and nothing to check about the caller).
+/// * `workload_check_requested`: whether the request to the key service carried
+///   the caller's workload GUID and token (see `needs_workload_check`).
 ///
 /// The caller's own override credentials are only ever passed on when the key
 /// service confirmed them (`workload_ok`); in every other case DataCrypt gets
@@ -209,11 +221,19 @@ pub fn plan(
     cached_key: Option<String>,
     outcome: Option<Result<ResolveResponse, ResolveFailure>>,
     caller: &Credentials,
+    workload_check_requested: bool,
 ) -> Plan {
     match outcome {
         // A fresh answer from the key service.
         Some(Ok(response)) => {
-            let creds = effective_credentials(&response, caller);
+            // workload_ok only means something if the service was actually asked about the
+            // caller's workload and token. Otherwise forward nothing, whatever it answered:
+            // this invariant must not depend on the server's behaviour.
+            let creds = if workload_check_requested {
+                effective_credentials(&response, caller)
+            } else {
+                Credentials::default()
+            };
             Plan::Use { key: response.key, creds, cache_it: true }
         }
         // The call failed: a still-valid cached key keeps protection working, but
@@ -381,42 +401,63 @@ mod tests {
 
     // ---- cache entry ----
 
+    const OTHER_GUID: &str = "11111111-2222-4333-8444-555555555555";
+
     #[test]
     fn cache_entry_round_trips_before_the_ttl() {
-        let bytes = encode_cache_entry("zone-key", 1_000);
-        assert_eq!(decode_cache_entry(&bytes, 1_000), Some("zone-key".to_string()));
-        assert_eq!(decode_cache_entry(&bytes, 1_000 + KEY_CACHE_TTL_MS - 1), Some("zone-key".to_string()));
+        let bytes = encode_cache_entry(GUID, "zone-key", 1_000);
+        assert_eq!(decode_cache_entry(&bytes, GUID, 1_000), Some("zone-key".to_string()));
+        assert_eq!(decode_cache_entry(&bytes, GUID, 1_000 + KEY_CACHE_TTL_MS - 1), Some("zone-key".to_string()));
     }
 
     #[test]
     fn cache_entry_expires_exactly_at_the_ttl() {
-        let bytes = encode_cache_entry("zone-key", 1_000);
-        assert_eq!(decode_cache_entry(&bytes, 1_000 + KEY_CACHE_TTL_MS), None);
-        assert_eq!(decode_cache_entry(&bytes, u64::MAX), None);
+        let bytes = encode_cache_entry(GUID, "zone-key", 1_000);
+        assert_eq!(decode_cache_entry(&bytes, GUID, 1_000 + KEY_CACHE_TTL_MS), None);
+        assert_eq!(decode_cache_entry(&bytes, GUID, u64::MAX), None);
+    }
+
+    #[test]
+    fn cache_entry_is_only_valid_for_the_key_id_it_was_fetched_for() {
+        // A policy reconfigured from zone A to zone B must never reuse zone A's cached key.
+        let bytes = encode_cache_entry(GUID, "zone-a-key", 1_000);
+        assert_eq!(decode_cache_entry(&bytes, GUID, 1_001), Some("zone-a-key".to_string()));
+        assert_eq!(decode_cache_entry(&bytes, OTHER_GUID, 1_001), None);
+        assert_eq!(decode_cache_entry(&bytes, "", 1_001), None);
+    }
+
+    #[test]
+    fn cache_entry_from_before_the_key_id_binding_is_ignored() {
+        // An entry written by the previous layout (no key_id) must never be trusted.
+        let old_layout = br#"{"key":"zone-key","expires_at_ms":999999999}"#;
+        assert_eq!(decode_cache_entry(old_layout, GUID, 0), None);
     }
 
     #[test]
     fn cache_entry_survives_awkward_keys() {
         for key in ["quote\"inside", "back\\slash", "unicode-é-✓", "new\nline", "a:b|c"] {
-            let bytes = encode_cache_entry(key, 5);
-            assert_eq!(decode_cache_entry(&bytes, 6), Some(key.to_string()), "{:?}", key);
+            let bytes = encode_cache_entry(GUID, key, 5);
+            assert_eq!(decode_cache_entry(&bytes, GUID, 6), Some(key.to_string()), "{:?}", key);
         }
     }
 
     #[test]
     fn cache_entry_does_not_overflow_near_the_end_of_time() {
-        let bytes = encode_cache_entry("k", u64::MAX - 1);
+        let bytes = encode_cache_entry(GUID, "k", u64::MAX - 1);
         // saturates instead of wrapping to a tiny expiry; it is simply "valid until the end of time".
-        assert_eq!(decode_cache_entry(&bytes, u64::MAX - 1), Some("k".to_string()));
+        assert_eq!(decode_cache_entry(&bytes, GUID, u64::MAX - 1), Some("k".to_string()));
     }
 
     #[test]
     fn cache_entry_rejects_garbage_and_empty_keys() {
-        assert_eq!(decode_cache_entry(b"", 0), None);
-        assert_eq!(decode_cache_entry(b"not json", 0), None);
-        assert_eq!(decode_cache_entry(br#"{"key":"","expires_at_ms":999999999}"#, 0), None);
-        assert_eq!(decode_cache_entry(br#"{"key":"k"}"#, 0), None);
-        assert_eq!(decode_cache_entry(br#"{"expires_at_ms":999999999}"#, 0), None);
+        assert_eq!(decode_cache_entry(b"", GUID, 0), None);
+        assert_eq!(decode_cache_entry(b"not json", GUID, 0), None);
+        let empty_key = format!(r#"{{"key_id":"{GUID}","key":"","expires_at_ms":999999999}}"#);
+        assert_eq!(decode_cache_entry(empty_key.as_bytes(), GUID, 0), None);
+        let no_expiry = format!(r#"{{"key_id":"{GUID}","key":"k"}}"#);
+        assert_eq!(decode_cache_entry(no_expiry.as_bytes(), GUID, 0), None);
+        let no_key = format!(r#"{{"key_id":"{GUID}","expires_at_ms":999999999}}"#);
+        assert_eq!(decode_cache_entry(no_key.as_bytes(), GUID, 0), None);
     }
 
     // ---- startup validation ----
@@ -481,7 +522,7 @@ mod tests {
     #[test]
     fn plan_fresh_ok_uses_the_callers_credentials_and_caches_the_key() {
         assert_eq!(
-            plan(None, ok("fresh-key", true), &caller()),
+            plan(None, ok("fresh-key", true), &caller(), true),
             Plan::Use { key: "fresh-key".to_string(), creds: caller(), cache_it: true }
         );
     }
@@ -489,7 +530,7 @@ mod tests {
     #[test]
     fn plan_fresh_workload_not_ok_blanks_the_credentials_but_still_caches_the_key() {
         assert_eq!(
-            plan(None, ok("fresh-key", false), &caller()),
+            plan(None, ok("fresh-key", false), &caller(), true),
             Plan::Use { key: "fresh-key".to_string(), creds: Credentials::default(), cache_it: true }
         );
     }
@@ -497,8 +538,25 @@ mod tests {
     #[test]
     fn plan_a_fresh_key_replaces_a_stale_cached_one() {
         assert_eq!(
-            plan(Some("old-key".to_string()), ok("new-key", true), &caller()),
+            plan(Some("old-key".to_string()), ok("new-key", true), &caller(), true),
             Plan::Use { key: "new-key".to_string(), creds: caller(), cache_it: true }
+        );
+    }
+
+    #[test]
+    fn plan_ignores_workload_ok_when_no_credentials_were_submitted() {
+        // The policy asked nothing about a workload (no token, or no GUID prefix), so even a
+        // misbehaving service answering workload_ok:true must not make it forward the
+        // caller's token or a legacy passphrase. The invariant must not depend on the server.
+        let legacy_style = creds("tok", "plain-legacy-passphrase");
+        assert_eq!(
+            plan(None, ok("fresh-key", true), &legacy_style, false),
+            Plan::Use { key: "fresh-key".to_string(), creds: Credentials::default(), cache_it: true }
+        );
+        // ...and the same answer still forwards when a check really was requested.
+        assert_eq!(
+            plan(None, ok("fresh-key", true), &caller(), true),
+            Plan::Use { key: "fresh-key".to_string(), creds: caller(), cache_it: true }
         );
     }
 
@@ -506,7 +564,7 @@ mod tests {
     fn plan_no_call_needed_uses_the_cached_key_with_blank_credentials() {
         // No token or no GUID prefix: nothing to validate, so nothing is forwarded.
         assert_eq!(
-            plan(Some("cached-key".to_string()), None, &creds("tok", "no-guid-prefix")),
+            plan(Some("cached-key".to_string()), None, &creds("tok", "no-guid-prefix"), false),
             Plan::Use { key: "cached-key".to_string(), creds: Credentials::default(), cache_it: false }
         );
     }
@@ -515,7 +573,7 @@ mod tests {
     fn plan_a_failed_call_falls_back_to_the_cached_key_with_blank_credentials() {
         for failure in [ResolveFailure::Rejected(401), ResolveFailure::Rejected(500), ResolveFailure::Malformed, ResolveFailure::Transport] {
             assert_eq!(
-                plan(Some("cached-key".to_string()), Some(Err(failure)), &caller()),
+                plan(Some("cached-key".to_string()), Some(Err(failure)), &caller(), true),
                 Plan::Use { key: "cached-key".to_string(), creds: Credentials::default(), cache_it: false }
             );
         }
@@ -524,13 +582,13 @@ mod tests {
     #[test]
     fn plan_a_failed_call_without_a_cached_key_blocks() {
         for failure in [ResolveFailure::Rejected(401), ResolveFailure::Rejected(409), ResolveFailure::Malformed, ResolveFailure::Transport] {
-            assert_eq!(plan(None, Some(Err(failure)), &caller()), Plan::Block);
+            assert_eq!(plan(None, Some(Err(failure)), &caller(), true), Plan::Block);
         }
     }
 
     #[test]
     fn plan_without_a_key_and_without_a_call_blocks() {
-        assert_eq!(plan(None, None, &caller()), Plan::Block);
+        assert_eq!(plan(None, None, &caller(), true), Plan::Block);
     }
 
     #[test]
@@ -542,7 +600,7 @@ mod tests {
             Some(Err(ResolveFailure::Rejected(500))),
         ];
         for outcome in outcomes {
-            if let Plan::Use { creds, .. } = plan(Some("cached".to_string()), outcome, &caller()) {
+            if let Plan::Use { creds, .. } = plan(Some("cached".to_string()), outcome, &caller(), true) {
                 assert_eq!(creds, Credentials::default());
             }
         }
@@ -550,7 +608,7 @@ mod tests {
 
     #[test]
     fn plan_debug_output_never_contains_the_key() {
-        let printed = format!("{:?}", plan(None, ok("THE-ZONE-KEY", true), &caller()));
+        let printed = format!("{:?}", plan(None, ok("THE-ZONE-KEY", true), &caller(), true));
         assert!(!printed.contains("THE-ZONE-KEY"), "{}", printed);
     }
 

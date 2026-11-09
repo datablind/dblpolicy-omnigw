@@ -926,7 +926,7 @@ async fn plan_resolved_key(
 ) -> Plan {
     let now_ms = now_millis(clock);
     let cached_key = now_ms
-        .and_then(|now| cache.get(KEY_CACHE_ENTRY).and_then(|bytes| decode_cache_entry(&bytes, now)));
+        .and_then(|now| cache.get(KEY_CACHE_ENTRY).and_then(|bytes| decode_cache_entry(&bytes, key_id, now)));
 
     let check_workload = needs_workload_check(caller);
     let outcome = if cached_key.is_some() && !check_workload {
@@ -941,7 +941,7 @@ async fn plan_resolved_key(
     };
 
     let called = outcome.is_some();
-    let decision = plan(cached_key, outcome, caller);
+    let decision = plan(cached_key, outcome, caller, check_workload);
     if let Plan::Use { key, creds, cache_it } = &decision {
         logger::info!(
             "{LOG_LABEL}Key resolution: service_called={called} workload_check_requested={check_workload} override_credentials_forwarded={}",
@@ -949,7 +949,7 @@ async fn plan_resolved_key(
         );
         if *cache_it {
             if let Some(now) = now_ms {
-                if cache.save(KEY_CACHE_ENTRY, encode_cache_entry(key, now)).is_err() {
+                if cache.save(KEY_CACHE_ENTRY, encode_cache_entry(key_id, key, now)).is_err() {
                     logger::warn!("{LOG_LABEL}Could not cache the DataBlind key");
                 }
             }
