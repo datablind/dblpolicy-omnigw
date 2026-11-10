@@ -260,7 +260,7 @@ confirm_group_id() {
   fi
 
   while true; do
-    read -r -p "Enter the number from the list above, or paste the correct group ID: " pick
+    read -r -p "Enter the option number from the list above, or paste the correct group ID: " pick
     if [[ "$pick" =~ ^[0-9]+$ && "$pick" -ge 1 && "$pick" -le ${#bg_ids[@]} ]]; then
       pick="${bg_ids[$((pick - 1))]}"
     fi

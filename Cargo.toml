@@ -1,7 +1,7 @@
 # Copyright 2023 Salesforce, Inc. All rights reserved.
 [package]
 name = "mcp_datablind"
-version = "1.8.18"
+version = "1.8.20"
 rust-version = "1.87.0"
 edition = "2018"
 resolver = "2"
@@ -9,7 +9,7 @@ resolver = "2"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [package.metadata.anypoint]
-group_id = "2fffe86c-fd03-4170-a6cf-c8bda6617fa2"
+group_id = "173b3eb5-ddfd-4513-93b1-7ba24fc4eed5"
 
 definition_asset_id = "mcp-datablind"
 implementation_asset_id = "mcp-datablind-flex"
