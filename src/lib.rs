@@ -929,7 +929,6 @@ async fn plan_resolved_key(
         let request = ResolveRequest {
             key_id,
             workload_guid: if check_workload { workload_guid_from_passphrase(&caller.passphrase) } else { None },
-            override_token: if check_workload { Some(caller.token.as_str()) } else { None },
         };
         Some(resolve_key(client, service, access_key, &request).await)
     };

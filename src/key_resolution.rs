@@ -18,14 +18,14 @@ pub const MAX_PASSPHRASE_LEN: usize = 512;
 
 const POLICY_ACCESS_KEY_PREFIX: &str = "dbpk_";
 
-/// Body of `POST <keyServiceUrl>/app-zone-key-resolve`.
+/// Body of `POST <keyServiceUrl>/app-zone-key-resolve`. The caller's override
+/// token is deliberately not part of it: DataCrypt validates the token, so the
+/// token never leaves the gateway except towards DataCrypt.
 #[derive(Serialize)]
 pub struct ResolveRequest<'a> {
     pub key_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workload_guid: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub override_token: Option<&'a str>,
 }
 
 /// `200 {"key": string, "workload_ok": bool}`.
@@ -113,7 +113,9 @@ pub fn effective_credentials(response: &ResolveResponse, caller: &Credentials) -
     }
 }
 
-/// Whether the key service must also be asked about the caller's token/workload.
+/// Whether the key service must also be asked about the caller's workload: only
+/// when the caller attempts an override (sends a token) with a workload GUID in
+/// the pass phrase. The token itself is not sent to the key service.
 pub fn needs_workload_check(caller: &Credentials) -> bool {
     !caller.token.is_empty() && workload_guid_from_passphrase(&caller.passphrase).is_some()
 }
@@ -200,7 +202,7 @@ impl fmt::Debug for Plan {
 /// * `outcome`: the key service's answer, or `None` when no call was made (a
 ///   valid cached key and nothing to check about the caller).
 /// * `workload_check_requested`: whether the request to the key service carried
-///   the caller's workload GUID and token (see `needs_workload_check`).
+///   the caller's workload GUID (see `needs_workload_check`).
 ///
 /// The caller's own override credentials are only ever passed on when the key
 /// service confirmed them (`workload_ok`); in every other case DataCrypt gets
@@ -587,11 +589,12 @@ mod tests {
 
     #[test]
     fn resolve_request_omits_absent_fields() {
-        let minimal = serde_json::to_value(ResolveRequest { key_id: GUID, workload_guid: None, override_token: None }).unwrap();
+        let minimal = serde_json::to_value(ResolveRequest { key_id: GUID, workload_guid: None }).unwrap();
         assert_eq!(minimal, serde_json::json!({ "key_id": GUID }));
 
-        let full = serde_json::to_value(ResolveRequest { key_id: GUID, workload_guid: Some(GUID), override_token: Some("tok") }).unwrap();
-        assert_eq!(full, serde_json::json!({ "key_id": GUID, "workload_guid": GUID, "override_token": "tok" }));
+        let full = serde_json::to_value(ResolveRequest { key_id: GUID, workload_guid: Some(GUID) }).unwrap();
+        // Exactly these two fields: the override token must never be sent to the key service.
+        assert_eq!(full, serde_json::json!({ "key_id": GUID, "workload_guid": GUID }));
     }
 
     #[test]

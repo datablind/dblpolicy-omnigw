@@ -182,7 +182,7 @@ Fill in **DataBlind Key ID** (5), **DataBlind Key Service URI** (5a) and **Polic
 **What happens on each call**
 
 - The policy asks DataBlind for the key (waiting at most 5 seconds) and keeps it in memory for **60 seconds**. Revoking a policy access key therefore takes effect within about a minute.
-- A caller who sends `dataBlindToken` and a `dataBlindPassphrase` of the form `<workload GUID>:<passphrase>` is checked by DataBlind on **every** request: the token must be active and unexpired and belong to that workload and app zone, and the workload must be active. Only then are the caller's token and passphrase passed on, and the caller gets the unprotected data. Revoking a token or workload takes effect on the next request.
+- A caller who sends `dataBlindToken` and a `dataBlindPassphrase` of the form `<workload GUID>:<passphrase>` is checked on **every** request. The policy tells DataBlind the workload GUID from the passphrase (never the token), and DataBlind confirms that workload is active and belongs to this app zone. Only then are the caller's token and passphrase passed on to the DataBlind service, which validates them and returns the unprotected data. Deactivating a workload therefore takes effect on the next request. Deactivating an individual override token in the control plane does not stop it: the token works until it expires.
 - If any check fails, or the caller sends no workload GUID, the data is simply returned **protected**. The caller's token and passphrase are not passed on.
 - If DataBlind cannot be reached, a key from the last 60 seconds still keeps data protected (and nobody gets unprotected data). With no key available, the response is blocked with an error instead of leaking data.
 
