@@ -1,13 +1,11 @@
 // Copyright 2023 Salesforce, Inc. All rights reserved.
 mod generated;
-mod key_resolution;
+mod workload_guid;
 
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
-use std::{io::Read, ops::Deref, time::{Duration, UNIX_EPOCH}};
+use std::{io::Read, ops::Deref};
 
-use pdk::cache::{Cache, CacheBuilder};
-use pdk::hl::timer::Clock;
 use pdk::hl::*;
 use pdk::logger;
 use pdk::script::{HandlerAttributesBinding, TryFromValue};
@@ -15,11 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generated::config::Config as GeneratedConfig;
-use crate::key_resolution::{
-    decode_cache_entry, encode_cache_entry, needs_workload_check, parse_resolve_response, plan,
-    validate_key_config, workload_guid_from_passphrase, Credentials, Plan,
-    ResolveFailure, ResolveRequest, ResolveResponse,
-};
+use crate::workload_guid::checked_workload_guid;
 
 // Policy version is sourced from the `version` field in Cargo.toml at compile time
 // (Cargo exposes it as CARGO_PKG_VERSION), so it never needs manual updating here.
@@ -34,12 +28,10 @@ const FILTER_PATH: &str = "/filter";
 const DATACRYPT_PATH: &str = "/datacrypt";
 const NLP_PATH: &str = "/datacrypt-nlp";
 
-// Key-resolution mode (see key_resolution.rs): the key service endpoint appended to
-// keyServiceUrl, how long to wait for it, and where the fetched key is cached.
-const KEY_RESOLVE_PATH: &str = "/app-zone-key-resolve";
-const KEY_SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
-const KEY_CACHE_ID: &str = "datablind-zone-key";
-const KEY_CACHE_ENTRY: &str = "zone-key";
+// What the DataBlind service answers, with status 200, when DataCrypt itself fails
+// (DataCryptApp: `response = "ERROR_TOKEN"`). It is not data and must never reach
+// the client in place of it.
+const DATACRYPT_FAILURE_TOKEN: &str = "ERROR_TOKEN";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EncryptMode {
@@ -78,7 +70,7 @@ impl RuntimeConfig {
 }
 
 /// A configuration parse failure that never repeats the configuration (it holds
-/// secrets such as policyAccessKey and dataCryptApiKey) or serde's message (which
+/// secrets such as dataCryptApiKey) or serde's message (which
 /// can echo a mistyped value): only the kind of error and where it is.
 fn config_parse_error(what: &str, err: &serde_json::Error) -> anyhow::Error {
     anyhow!(
@@ -149,10 +141,13 @@ impl DictumSummary {
 }
 
 /// Request body expected by the DataCrypt REST service (see DataCryptApp.RequestBody).
+///
+/// There is deliberately no `key`: the service fetches the key of the workload's app
+/// zone itself (`workloadGuId`), so the key never passes through the policy.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DataCryptRequest {
-    key: String,
+    workload_gu_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tweak: Option<String>,
     data: Value,
@@ -762,6 +757,17 @@ fn join_service_path(service: &Service, endpoint_path: &str) -> String {
     join_uri_path(service.uri().path(), endpoint_path)
 }
 
+/// The token in a 200 answer from the DataBlind service. Its failure marker is an
+/// error, not a token: returning it would put the marker into the client's response
+/// in place of the data, so the caller blocks the response instead.
+fn token_from_datacrypt_response(body: &[u8]) -> Result<String> {
+    let parsed: DataCryptResponse = serde_json::from_slice(body)?;
+    if parsed.token == DATACRYPT_FAILURE_TOKEN {
+        return Err(anyhow!("the service reported a processing failure"));
+    }
+    Ok(parsed.token)
+}
+
 /// Performs a POST against the DataCrypt service and returns the resulting token.
 async fn call_datacrypt(
     client: &HttpClient,
@@ -797,8 +803,9 @@ async fn call_datacrypt(
     let status = response.status_code();
     logger::info!("{LOG_LABEL}{operation} HTTP response code: {status}");
     if status == 200 {
-        let parsed: DataCryptResponse = serde_json::from_slice(response.body())?;
-        Ok((status, parsed.token))
+        let token = token_from_datacrypt_response(response.body())
+            .map_err(|err| anyhow!("DataCrypt {operation} at {request_path}: {err}"))?;
+        Ok((status, token))
     } else {
         Err(anyhow!(
             "DataCrypt {operation} returned status {status} for {request_path}: {}",
@@ -845,112 +852,6 @@ fn block_unprotected_response(handler: &dyn HeadersBodyHandler) {
     }
 }
 
-/// Where the DataBlind key comes from for this policy instance.
-enum KeyMode<'a> {
-    /// The key is fetched from datablindcp with a policy access key.
-    Resolved { key_id: &'a str, service: &'a Service, access_key: &'a str },
-    /// The key ID or access key is blank. Startup validation prevents this; if it
-    /// ever happened the response is blocked rather than encrypting with some other key.
-    Misconfigured,
-}
-
-fn key_mode(config: &RuntimeConfig) -> KeyMode<'_> {
-    let key_id = config.key_id.trim();
-    let access_key = config.policy_access_key.trim();
-    if key_id.is_empty() || access_key.is_empty() {
-        return KeyMode::Misconfigured;
-    }
-    KeyMode::Resolved { key_id, service: &config.key_service_url, access_key }
-}
-
-/// Milliseconds since the Unix epoch, or None if the clock is unusable (then the
-/// key cache is bypassed rather than trusted with a bogus time).
-fn now_millis(clock: &Clock) -> Option<u64> {
-    clock.now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
-}
-
-/// Asks the key service for the app zone key (and, when the caller sent override
-/// credentials, whether they are valid). Logs only status codes: never the key,
-/// the access key, the caller's credentials, or a response body.
-async fn resolve_key(
-    client: &HttpClient,
-    service: &Service,
-    access_key: &str,
-    request: &ResolveRequest<'_>,
-) -> Result<ResolveResponse, ResolveFailure> {
-    let path = join_service_path(service, KEY_RESOLVE_PATH);
-    let body = serde_json::to_vec(request).map_err(|_| ResolveFailure::Malformed)?;
-    let headers: Vec<(&str, &str)> = vec![
-        ("Content-Type", "application/json"),
-        ("x-policy-access-key", access_key),
-    ];
-
-    let response = client
-        .request(service)
-        .path(&path)
-        .headers(headers)
-        .body(&body)
-        .timeout(KEY_SERVICE_TIMEOUT)
-        .post()
-        .await
-        .map_err(|_| {
-            logger::warn!("{LOG_LABEL}Key service request failed (network error or timeout)");
-            ResolveFailure::Transport
-        })?;
-
-    let status = response.status_code();
-    if status != 200 {
-        logger::warn!("{LOG_LABEL}Key service answered with status {status}");
-    }
-    parse_resolve_response(status, response.body())
-}
-
-/// Key-resolution mode: decides which key to use and which override credentials
-/// DataCrypt may see, using the cache where that is safe. The workload/token
-/// verdict is never cached: a request that carries override credentials always
-/// asks the key service, so revocation applies on the very next request.
-async fn plan_resolved_key(
-    client: &HttpClient,
-    cache: &dyn Cache,
-    clock: &Clock,
-    key_id: &str,
-    service: &Service,
-    access_key: &str,
-    caller: &Credentials,
-) -> Plan {
-    let now_ms = now_millis(clock);
-    let cached_key = now_ms
-        .and_then(|now| cache.get(KEY_CACHE_ENTRY).and_then(|bytes| decode_cache_entry(&bytes, key_id, now)));
-
-    let check_workload = needs_workload_check(caller);
-    let outcome = if cached_key.is_some() && !check_workload {
-        None
-    } else {
-        let request = ResolveRequest {
-            key_id,
-            workload_guid: if check_workload { workload_guid_from_passphrase(&caller.passphrase) } else { None },
-        };
-        Some(resolve_key(client, service, access_key, &request).await)
-    };
-
-    let called = outcome.is_some();
-    let decision = plan(cached_key, outcome, caller, check_workload);
-    if let Plan::Use { key, creds, cache_it } = &decision {
-        logger::info!(
-            "{LOG_LABEL}Key resolution: service_called={called} workload_check_requested={check_workload} override_credentials_forwarded={}",
-            !creds.token.is_empty()
-        );
-        if *cache_it {
-            if let Some(now) = now_ms {
-                if cache.save(KEY_CACHE_ENTRY, encode_cache_entry(key_id, key, now)).is_err() {
-                    logger::warn!("{LOG_LABEL}Could not cache the DataBlind key");
-                }
-            }
-        }
-    }
-    decision
-}
-
 /// Reads override credentials and trace context from the inbound request so they are available
 /// when the upstream response is processed.
 async fn request_filter(state: RequestState, config: &RuntimeConfig) -> Flow<RequestContext> {
@@ -995,8 +896,6 @@ async fn response_filter(
     request_data: RequestData<RequestContext>,
     config: &RuntimeConfig,
     client: &HttpClient,
-    cache: &dyn Cache,
-    clock: &Clock,
 ) {
     let request_context = match request_data {
         RequestData::Continue(context) => context,
@@ -1043,40 +942,25 @@ async fn response_filter(
         log_message("Outbound message (upstream)", &payload_bytes);
     }
 
-    let mut credentials = request_context;
+    // The caller's override credentials go to the DataBlind service exactly as received:
+    // DataCrypt validates the token and pass phrase, nothing in the policy does.
+    let credentials = request_context;
     let mut dictum = DictumSummary::default();
     let field_count = count_sensitive_fields(config);
     let data_crypt_api_key = normalized_api_key(&config.data_crypt_api_key);
     warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
-    let key: String = match key_mode(config) {
-        KeyMode::Misconfigured => {
-            logger::error!("{LOG_LABEL}Key resolution is not fully configured; blocking the response");
+    // The service fetches the key itself, from the workload GUID. Startup validation
+    // prevents an unusable value; if it ever happened the response is blocked rather
+    // than protected under some other key.
+    let workload_gu_id: String = match checked_workload_guid(&config.workload_guid) {
+        Ok(guid) => guid.to_string(),
+        Err(_) => {
+            logger::error!("{LOG_LABEL}workloadGuid is not configured correctly; blocking the response");
             block_unprotected_response(headers_body_handler);
             return;
         }
-        KeyMode::Resolved { key_id, service, access_key } => {
-            let caller = Credentials {
-                token: credentials.token.clone(),
-                passphrase: credentials.passphrase.clone(),
-            };
-            match plan_resolved_key(client, cache, clock, key_id, service, access_key, &caller).await {
-                Plan::Block => {
-                    logger::warn!("{LOG_LABEL}No DataBlind key is available from the key service; blocking the response");
-                    block_unprotected_response(headers_body_handler);
-                    return;
-                }
-                Plan::Use { key, creds, .. } => {
-                    // DataCrypt only ever sees override credentials the key service confirmed.
-                    credentials.token = creds.token;
-                    credentials.passphrase = creds.passphrase;
-                    key
-                }
-            }
-        }
     };
-    // TEMP(testing): logging raw secret value — remove before release.
-    // logger::info!("{LOG_LABEL}Resolved dataBlindKey: {key}");
 
     let mut tweak_eval = config.tweak.evaluator();
     tweak_eval.bind_payload(&headers_body_state);
@@ -1123,7 +1007,7 @@ async fn response_filter(
                 .unwrap_or_else(|_| filter_rule.to_string())
         );
         let request = DataCryptRequest {
-            key: key.clone(),
+            workload_gu_id: workload_gu_id.clone(),
             tweak: None,
             data: datacrypt_data.clone(),
             sensitive_fields: None,
@@ -1185,7 +1069,7 @@ async fn response_filter(
             );
 
             let request = DataCryptRequest {
-                key: key.clone(),
+                workload_gu_id: workload_gu_id.clone(),
                 tweak: Some(tweak.clone()),
                 data: datacrypt_data.clone(),
                 sensitive_fields,
@@ -1232,7 +1116,7 @@ async fn response_filter(
             );
 
             let request = DataCryptRequest {
-                key: key.clone(),
+                workload_gu_id: workload_gu_id.clone(),
                 tweak: Some(tweak.clone()),
                 data: datacrypt_data.clone(),
                 sensitive_fields: None,
@@ -1309,23 +1193,69 @@ async fn response_filter(
     logger::info!("{LOG_LABEL}Set {DICTUM_HEADER}: {dictum_value}");
 }
 
+#[cfg(test)]
+mod datacrypt_response_tests {
+    use super::*;
+
+    #[test]
+    fn a_normal_token_is_returned() {
+        assert_eq!(
+            token_from_datacrypt_response(br#"{"token":"{\"name\":\"abc\"}"}"#).unwrap(),
+            r#"{"name":"abc"}"#
+        );
+    }
+
+    #[test]
+    fn the_failure_marker_is_an_error_not_a_token() {
+        assert!(token_from_datacrypt_response(br#"{"token":"ERROR_TOKEN"}"#).is_err());
+    }
+
+    #[test]
+    fn only_the_exact_marker_is_a_failure() {
+        for token in ["ERROR_TOKEN2", "error_token", " ERROR_TOKEN", "an ERROR_TOKEN inside"] {
+            let body = format!(r#"{{"token":"{token}"}}"#);
+            assert_eq!(token_from_datacrypt_response(body.as_bytes()).unwrap(), token);
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_token_answer_is_an_error() {
+        for body in [&b""[..], b"not json", br#"{"other":"x"}"#, br#"{"token":5}"#] {
+            assert!(token_from_datacrypt_response(body).is_err());
+        }
+    }
+
+    #[test]
+    fn the_request_carries_the_workload_and_never_a_key() {
+        let request = DataCryptRequest {
+            workload_gu_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            tweak: None,
+            data: Value::Null,
+            sensitive_fields: None,
+            filter_rule: None,
+            over_ride_token: String::new(),
+            over_ride_pass_phrase: String::new(),
+        };
+        let json: Value = serde_json::to_value(&request).unwrap();
+        let object = json.as_object().unwrap();
+        assert_eq!(object["workloadGuId"], "11111111-2222-4333-8444-555555555555");
+        assert!(!object.contains_key("key"));
+        assert!(object.contains_key("overRideToken") && object.contains_key("overRidePassPhrase"));
+    }
+}
+
 #[entrypoint]
 async fn configure(
     launcher: Launcher,
     Configuration(bytes): Configuration,
     client: HttpClient,
-    cache_builder: CacheBuilder,
-    clock: Clock,
 ) -> Result<()> {
     let config = RuntimeConfig::from_bytes(&bytes)?;
 
-    // Refuse to start on a configuration that cannot work or could fall back to the
-    // wrong key. The messages name the setting, never its value.
-    validate_key_config(&config.key_id, &config.policy_access_key)
-        .map_err(|message| anyhow!("Invalid DataBlind key configuration: {message}"))?;
-
-    // One in-memory cache per policy instance; it only ever holds the fetched key.
-    let cache = cache_builder.new(KEY_CACHE_ID.to_string()).max_entries(1).build();
+    // Refuse to start on a configuration that cannot work: the workload GUID decides
+    // which app zone's key is used. The message names the setting, never its value.
+    checked_workload_guid(&config.workload_guid)
+        .map_err(|message| anyhow!("Invalid DataBlind workload configuration: {message}"))?;
 
     // Warn-level so this appears even when policy logging is set to warn in API Manager.
     logger::warn!(
@@ -1347,7 +1277,7 @@ async fn configure(
 
     let filter = on_request(|rs| request_filter(rs, &config))
         .on_response(|rs, request_data| {
-        response_filter(rs, request_data, &config, &client, &cache, &clock)
+        response_filter(rs, request_data, &config, &client)
     });
 
     launcher.launch(filter).await?;

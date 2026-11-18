@@ -98,24 +98,13 @@ spec:
       "@context":
         "@characteristics":
           - security:sensitive
-    keyId:
+    workloadGuid:
       type: string
-      title: 5. DataBlind Key ID
+      title: 5. DataBlind Workload GUID
       description: >-
-        The GUID of the DataBlind app zone. The policy fetches the app zone's key from DataBlind
-        at request time. Requires 5a and 5b.
-    keyServiceUrl:
-      type: string
-      format: service
-      title: 5a. DataBlind Key Service URI
-      description: Base URI of the DataBlind control plane functions, e.g. https://<project>.supabase.co/functions/v1
-    policyAccessKey:
-      type: string
-      title: 5b. Policy Access Key
-      description: Created in DataBlind for the app zone. Sent as the x-policy-access-key header when fetching the key.
-      "@context":
-        "@characteristics":
-          - security:sensitive
+        The GUID of the DataBlind workload this policy is registered as in DataBlind. The DataBlind
+        service uses it to fetch the key of the workload's app zone, so the key is never held by
+        the policy. Required.
     tweak:
       type: string
       format: dataweave
@@ -152,9 +141,7 @@ spec:
         payloads. Leave disabled in higher environments (e.g. Prod) to avoid logging sensitive data.
       default: false
   required:
-    - keyId
-    - keyServiceUrl
-    - policyAccessKey
+    - workloadGuid
     - tweak
     - eligibleHttpCodes
     - dataBlindToken

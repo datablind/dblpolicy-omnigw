@@ -36,19 +36,12 @@ pub struct Config {
     pub filter_mode: Option<String>,
     #[serde(alias = "filterOperator")]
     pub filter_operator: Option<String>,
-    #[serde(alias = "keyId")]
-    pub key_id: String,
-    #[serde(
-        alias = "keyServiceUrl",
-        deserialize_with = "pdk::serde::deserialize_service"
-    )]
-    pub key_service_url: pdk::hl::Service,
-    #[serde(alias = "policyAccessKey")]
-    pub policy_access_key: String,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<String>,
     #[serde(alias = "tweak", deserialize_with = "de_tweak_3")]
     pub tweak: pdk::script::Script,
+    #[serde(alias = "workloadGuid")]
+    pub workload_guid: String,
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
@@ -60,7 +53,6 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
             )
         })?;
     abi.service_create(config.data_crypt_service)?;
-    abi.service_create(config.key_service_url)?;
     abi.setup()?;
     Ok(())
 }
