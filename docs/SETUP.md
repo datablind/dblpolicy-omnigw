@@ -153,35 +153,34 @@ The policy takes effect on the gateway within a short time. It runs on the **res
 | – | **Filter Conditions** | One or more rows of **Field** (JSON path such as `person.phone`), **Match Type** (`Simple`, `Exact`, `Regex`) and **Value**. Use commas for several values (`123,456`). |
 | 3 | **DataBlind Service URI** | The base URL of the DataBlind service, including the stage, for example `https://…execute-api.us-west-1.amazonaws.com/Dev`. Use the URL you were given. |
 | 4 | **DataBlind Service Key** | The API key for the service (sent as the `x-api-key` header). The placeholder text must be replaced or calls fail with **403 Forbidden**. |
-| 5 | **DataBlind Workload GUID** | The GUID of the DataBlind workload this policy is registered as. The DataBlind service uses it to get the key of the workload's app zone, so the key is never stored in, or passed through, the policy. Required. See [Key resolution](#key-resolution). |
-| 6 | **Tweak** | A value that makes encryption specific to each record, as a DataWeave expression. The default `#[payload.Id default '12345678']` uses the `Id` field of the response. |
-| 7 | **Eligible HTTP Codes** | Only responses with these status codes are protected, for example `#['200,201,202,205,213']`. Other responses pass through untouched. |
-| 8 | **DataBlind Token** | A header that, together with the passphrase, lets a trusted caller receive the original unprotected data. Default: the `dataBlindToken` request header. |
-| 9 | **DataBlind Passphrase** | The matching passphrase. Default: the `dataBlindPassphrase` request header. |
-| 10 | **Debug Logging** | Leave **off**. Turning it on writes request and response contents to the gateway logs, which may include sensitive data. Use it only in development environments. |
+| 5 | **Tweak** | A value that makes encryption specific to each record, as a DataWeave expression. The default `#[payload.Id default '12345678']` uses the `Id` field of the response. |
+| 6 | **Eligible HTTP Codes** | Only responses with these status codes are protected, for example `#['200,201,202,205,213']`. Other responses pass through untouched. |
+| 7 | **DataBlind Token** | A header that, together with the passphrase, lets a trusted caller receive the original unprotected data. Default: the `dataBlindToken` request header. |
+| 8 | **DataBlind Passphrase** | The caller's passphrase, in the form `<workload GUID>:<passphrase>`. **Every** request must carry it: the workload GUID in front of the first `:` tells the service which DataBlind workload, and so which app zone's key, to use, and a request without one is blocked. Together with the token it lets a trusted caller receive the original unprotected data. Default: the `dataBlindPassphrase` request header. See [Key resolution](#key-resolution). |
+| 9 | **Debug Logging** | Leave **off**. Turning it on writes request and response contents to the gateway logs, which may include sensitive data. Use it only in development environments. |
 
 ---
 
 ## Key resolution
 
-The policy does not hold the DataBlind key and never sees it. It tells the DataBlind service which workload it is, and the service gets the key of that workload's app zone from DataBlind.
+The policy does not hold the DataBlind key and never sees it. It tells the DataBlind service which workload the request belongs to, and the service gets the key of that workload's app zone from DataBlind. The workload comes from the caller: it is the GUID at the start of the `dataBlindPassphrase`.
 
 **Set up in DataBlind**
 
 1. Open the app zone. The organization must have *save sensitive data* turned on, so the zone's key is stored.
-2. Register a workload for **DataBlind** in that app zone, for this policy, and note its **GUID**.
+2. Register a workload for **DataBlind** in that app zone, for each caller (or kind of caller), and note its **GUID**.
 3. When you create an override token, choose the app zone **and the workload**. The passphrase you must send is shown as `<workload GUID>:<passphrase>`.
 
-**Set up in the policy**
+**What callers must send**
 
-Fill in **DataBlind Workload GUID** (5) with the GUID from step 2. It is required: a policy with a blank or invalid one refuses to start. The GUID decides which app zone's key the policy uses.
+Every request through the policy must carry a `dataBlindPassphrase` that starts with the caller's workload GUID and a colon, whether or not it is asking for unprotected data. There is nothing to fill in on the policy for this. A request whose passphrase is missing or does not start with a GUID and a colon is **blocked** (the response is replaced by an error), never returned unprotected.
 
 The DataBlind service itself must be set up to reach DataBlind (its URL and a secret that DataBlind shares with it). That is done on the service, not in the policy.
 
 **What happens on each call**
 
-- Every request to the DataBlind service carries the workload GUID and no key. The service asks DataBlind for the key each time, proving who it is with the shared secret, and DataBlind only answers if the workload is active, is a DataBlind workload, and its app zone is active.
-- Deactivating the policy's workload, or its app zone, in DataBlind therefore withdraws the policy's access to the key.
+- Every request to the DataBlind service carries the workload GUID taken from the passphrase and no key. The service asks DataBlind for the key each time, proving who it is with the shared secret, and DataBlind only answers if the workload is active, is a DataBlind workload, and its app zone is active.
+- The caller chooses the workload, so the policy cannot restrict which zone's key a request uses: that is decided in DataBlind. Deactivating a workload, or its app zone, withdraws that caller's access.
 - A caller who sends `dataBlindToken` and a `dataBlindPassphrase` of the form `<workload GUID>:<passphrase>` has both passed on **unchanged** to the DataBlind service, which validates them and returns the unprotected data. The policy does not check them itself. Deactivating an override token, or the workload it was issued for, does **not** stop it: the token works until it expires.
 - If the DataBlind service reports a processing failure, the response is blocked with an error instead of returning the failure text in place of the data.
 
@@ -219,8 +218,8 @@ If the response is **not** protected, see the troubleshooting table below.
 | Release fails because the version exists | Let the script pick a new version, or set `version` in `Cargo.toml` to an unused one. |
 | **MCP DataBlind** is missing in API Manager | Check Exchange: is it in the same business group as your environment's organization? Check the gateway is version 1.6.1 or newer. |
 | Calls return **403 Forbidden** from DataBlind | The **DataBlind Service Key** is still the placeholder or is wrong. Contact **mulesoftconnector@ztensor.com** for a key. |
-| A policy that used the old **DataBlind Key**, **Key ID**, **Key Service URI** or **Policy Access Key** settings stops working after you move it to this version | Those settings were removed. Register a DataBlind workload for the policy, fill in **DataBlind Workload GUID** (5), then re-apply. Always try a new version in a non-production environment first. |
-| The policy fails to start | **DataBlind Workload GUID** (5) is blank or not a GUID. The error names the setting. |
+| A policy that used the old **DataBlind Key**, **Key ID**, **Key Service URI** or **Policy Access Key** settings stops working after you move it to this version | Those settings were removed. Register a DataBlind workload for each caller and have them send `<workload GUID>:<passphrase>` in `dataBlindPassphrase`, then re-apply. Always try a new version in a non-production environment first. |
+| Calls return **500** and the gateway log says *No usable workload GUID in the pass phrase* | The request's `dataBlindPassphrase` header is missing, or does not start with a GUID and a colon. Send `<workload GUID>:<passphrase>`. |
 | Calls return **500** `DataBlind policy failed to apply` | The DataBlind service reported a failure. Most often it could not get the key: the workload is inactive or not a DataBlind workload, its app zone is inactive or has no stored key, or the secret shared between the service and DataBlind does not match. Check the DataBlind service's log and the `app-zone-key-resolve` function's log in DataBlind. |
 | An override token no longer unprotects data | The token expired or was deactivated, the workload is inactive, or the passphrase is missing the `<workload GUID>:` prefix. |
 | Response is not protected | The response status code is not in **Eligible HTTP Codes**, or **Sensitive Data Encryption** is `None`, or the **Sensitive Fields** names do not match your data. |
@@ -234,5 +233,6 @@ If the response is **not** protected, see the troubleshooting table below.
 - Keep **Debug Logging** off outside development environments.
 - Treat the **Service Key** and the Connected App secret like passwords. Do not commit them to git or share them in chat.
 - Use a Connected App with only the scopes it needs, and rotate its secret if it is ever exposed.
-- The DataBlind key is neither stored in nor passed through the policy. Deactivating the policy's workload in DataBlind withdraws its access without changing the key.
+- The DataBlind key is neither stored in nor passed through the policy. Deactivating a workload in DataBlind withdraws its access without changing the key.
+- The workload GUID comes from the caller, so who may use which zone's key is decided entirely by DataBlind (the workload must exist, be active and belong to an active app zone). Do not register workloads for callers that should not reach a zone's key.
 - Choose **For this release only** in `release.sh` when releasing from a shared machine, so no credentials are left behind.

@@ -1,6 +1,6 @@
 # DataBlind Policy Key Resolution Implementation Plan
 
-> **Superseded 2026-11-18.** This plan describes the policy access key flow. The policy now sends the DataBlind service its own workload GUID (`workloadGuid`) and no key; the service fetches the key from datablindcp itself. `key_resolution.rs` was replaced by `workload_guid.rs`. See `datablindcp`'s design doc, "Revision 2026-11-18". Kept for history only.
+> **Superseded 2026-11-18.** This plan describes the policy access key flow. The policy now sends the DataBlind service the workload GUID taken from the front of the caller's pass phrase (`<workload GUID>:<passphrase>`) and no key; the service fetches the key from datablindcp itself. `key_resolution.rs` was replaced by `workload_guid.rs`. See `datablindcp`'s design doc, "Revision 2026-11-18". Kept for history only.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

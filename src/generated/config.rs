@@ -40,8 +40,6 @@ pub struct Config {
     pub sensitive_fields_multi_line: Option<String>,
     #[serde(alias = "tweak", deserialize_with = "de_tweak_3")]
     pub tweak: pdk::script::Script,
-    #[serde(alias = "workloadGuid")]
-    pub workload_guid: String,
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {

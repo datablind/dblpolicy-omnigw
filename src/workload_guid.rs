@@ -1,13 +1,15 @@
-// The DataBlind workload this policy is registered as.
+// The DataBlind workload a request belongs to.
 //
-// The policy never holds or fetches the data key. It sends the DataBlind service
-// (the AWS Lambda behind dataCryptService) the GUID of its own workload, and the
-// service asks datablindcp for the key of that workload's app zone. The setting
-// therefore pins which zone's key this policy instance uses, so it must be a
-// well-formed GUID or the policy must not run.
+// The policy never holds or fetches the data key. The caller's pass phrase has the
+// form `<workload GUID>:<passphrase>`, and the policy sends the DataBlind service
+// (the AWS Lambda behind dataCryptService) the GUID part; the service asks
+// datablindcp for the key of that workload's app zone. The GUID therefore selects
+// which zone's key is used, and it comes from the caller, so datablindcp is what
+// decides whether that workload may be used (it must exist, be active and have an
+// app zone). The policy only makes sure the value is a well-formed GUID, and
+// blocks the response when it is not.
 //
-// Nothing here does I/O or logging. Error texts name the setting and never repeat
-// its value.
+// Nothing here does I/O or logging. Error texts never repeat the pass phrase.
 
 /// 8-4-4-4-12 hexadecimal digits, either case, and nothing else.
 pub fn is_uuid(s: &str) -> bool {
@@ -19,15 +21,17 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// The configured workload GUID with surrounding whitespace removed, or why it
-/// cannot be used.
-pub fn checked_workload_guid(configured: &str) -> Result<&str, String> {
-    let guid = configured.trim();
-    if guid.is_empty() {
-        return Err("workloadGuid is required (the GUID of this policy's DataBlind workload)".to_string());
-    }
+/// The workload GUID in front of the first `:` of the caller's pass phrase, or why
+/// there is none. Nothing is trimmed: a pass phrase that does not start with a GUID
+/// followed by `:` is refused as received.
+pub fn workload_guid_from_passphrase(passphrase: &str) -> Result<&str, String> {
+    let Some((guid, _)) = passphrase.split_once(':') else {
+        return Err(
+            "the pass phrase must have the form <workload GUID>:<passphrase>".to_string(),
+        );
+    };
     if !is_uuid(guid) {
-        return Err("workloadGuid must be a UUID (the GUID of this policy's DataBlind workload)".to_string());
+        return Err("the pass phrase does not start with a workload GUID".to_string());
     }
     Ok(guid)
 }
@@ -62,23 +66,42 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_guid_is_returned_trimmed() {
-        assert_eq!(checked_workload_guid(GUID), Ok(GUID));
-        assert_eq!(checked_workload_guid(&format!("  {GUID}\n")), Ok(GUID));
+    fn the_guid_is_the_part_before_the_first_colon() {
+        assert_eq!(workload_guid_from_passphrase(&format!("{GUID}:pass")), Ok(GUID));
+        // Everything after the first colon belongs to the passphrase, colons included.
+        assert_eq!(workload_guid_from_passphrase(&format!("{GUID}:a:b:c")), Ok(GUID));
+        // An empty passphrase part is the DataBlind service's to judge, not ours.
+        assert_eq!(workload_guid_from_passphrase(&format!("{GUID}:")), Ok(GUID));
+        assert_eq!(
+            workload_guid_from_passphrase(&format!("{}:pass", GUID.to_uppercase())),
+            Ok(GUID.to_uppercase().as_str())
+        );
     }
 
     #[test]
-    fn a_blank_or_malformed_guid_is_refused() {
-        for bad in ["", "   ", "not-a-guid", "11111111-2222-4333-8444"] {
-            assert!(checked_workload_guid(bad).is_err(), "{bad:?}");
+    fn a_pass_phrase_without_a_leading_guid_is_refused() {
+        for bad in [
+            "".to_string(),
+            "pass".to_string(),
+            GUID.to_string(),                           // no colon
+            format!(":{GUID}"),                         // colon first
+            format!(" {GUID}:pass"),                    // leading space
+            format!("{GUID} :pass"),                    // space before the colon
+            format!("{}:pass", &GUID[..35]),            // one short
+            format!("{GUID}0:pass"),                    // one long
+            "not-a-guid:pass".to_string(),
+            format!("pass:{GUID}"),                     // GUID in the wrong place
+        ] {
+            assert!(workload_guid_from_passphrase(&bad).is_err(), "{bad:?}");
         }
     }
 
     #[test]
-    fn errors_name_the_setting_and_never_repeat_the_value() {
-        let value = "super-secret-looking-but-not-a-guid";
-        let message = checked_workload_guid(value).unwrap_err();
-        assert!(message.contains("workloadGuid"));
-        assert!(!message.contains(value));
+    fn errors_never_repeat_the_pass_phrase() {
+        let secret = "hunter2-secret-passphrase";
+        for input in [secret.to_string(), format!("{secret}:{secret}")] {
+            let message = workload_guid_from_passphrase(&input).unwrap_err();
+            assert!(!message.contains(secret), "{message}");
+        }
     }
 }

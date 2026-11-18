@@ -98,17 +98,10 @@ spec:
       "@context":
         "@characteristics":
           - security:sensitive
-    workloadGuid:
-      type: string
-      title: 5. DataBlind Workload GUID
-      description: >-
-        The GUID of the DataBlind workload this policy is registered as in DataBlind. The DataBlind
-        service uses it to fetch the key of the workload's app zone, so the key is never held by
-        the policy. Required.
     tweak:
       type: string
       format: dataweave
-      title: 6. Tweak
+      title: 5. Tweak
       description: Payload Field to be used as Encryption Tweak
       default: "#[payload.Id default '12345678']"
       bindings:
@@ -118,30 +111,33 @@ spec:
     eligibleHttpCodes:
       type: string
       format: dataweave
-      title: 7. Eligible HTTP Codes
+      title: 6. Eligible HTTP Codes
       description: Apply Datablind only when the API response has the following HTTP Codes
       default: "#['200,201,202,205,213']"
     dataBlindToken:
       type: string
       format: dataweave
-      title: 8. DataBlind Token
+      title: 7. DataBlind Token
       description: When a valid override token is provided, Datablind returns the unencrypted and unmasked data
       default: "#[attributes.headers['dataBlindToken']]"
     dataBlindPassphrase:
       type: string
       format: dataweave
-      title: 9. DataBlind Passphrase
-      description: When a valid override token passphrase is provided, Datablind returns the unencrypted and unmasked data
+      title: 8. DataBlind Passphrase
+      description: >-
+        The caller's pass phrase, in the form <workload GUID>:<passphrase>. The workload GUID selects
+        the DataBlind workload (and so the app zone key) used for the request; a request without one
+        is blocked. When a valid override token and passphrase are provided, Datablind returns the
+        unencrypted and unmasked data.
       default: "#[attributes.headers['dataBlindPassphrase']]"
     debugLogging:
       type: boolean
-      title: 10. Debug Logging (Request/Response Payloads)
+      title: 9. Debug Logging (Request/Response Payloads)
       description: >-
         Enable in lower environments (e.g. Dev/Test) to log the request and response message
         payloads. Leave disabled in higher environments (e.g. Prod) to avoid logging sensitive data.
       default: false
   required:
-    - workloadGuid
     - tweak
     - eligibleHttpCodes
     - dataBlindToken

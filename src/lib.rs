@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generated::config::Config as GeneratedConfig;
-use crate::workload_guid::checked_workload_guid;
+use crate::workload_guid::workload_guid_from_passphrase;
 
 // Policy version is sourced from the `version` field in Cargo.toml at compile time
 // (Cargo exposes it as CARGO_PKG_VERSION), so it never needs manual updating here.
@@ -950,13 +950,14 @@ async fn response_filter(
     let data_crypt_api_key = normalized_api_key(&config.data_crypt_api_key);
     warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
-    // The service fetches the key itself, from the workload GUID. Startup validation
-    // prevents an unusable value; if it ever happened the response is blocked rather
-    // than protected under some other key.
-    let workload_gu_id: String = match checked_workload_guid(&config.workload_guid) {
+    // The service fetches the key itself, from the workload GUID the caller put in
+    // front of the pass phrase. Without a well-formed one the response is blocked
+    // rather than sent unprotected or protected under some other key. The pass
+    // phrase itself is never logged.
+    let workload_gu_id: String = match workload_guid_from_passphrase(&credentials.passphrase) {
         Ok(guid) => guid.to_string(),
-        Err(_) => {
-            logger::error!("{LOG_LABEL}workloadGuid is not configured correctly; blocking the response");
+        Err(reason) => {
+            logger::error!("{LOG_LABEL}No usable workload GUID in the pass phrase ({reason}); blocking the response");
             block_unprotected_response(headers_body_handler);
             return;
         }
@@ -1251,11 +1252,6 @@ async fn configure(
     client: HttpClient,
 ) -> Result<()> {
     let config = RuntimeConfig::from_bytes(&bytes)?;
-
-    // Refuse to start on a configuration that cannot work: the workload GUID decides
-    // which app zone's key is used. The message names the setting, never its value.
-    checked_workload_guid(&config.workload_guid)
-        .map_err(|message| anyhow!("Invalid DataBlind workload configuration: {message}"))?;
 
     // Warn-level so this appears even when policy logging is set to warn in API Manager.
     logger::warn!(
