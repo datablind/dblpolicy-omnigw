@@ -1,6 +1,6 @@
-// The DataBlind workload a request belongs to.
+// Where the data key for a request comes from.
 //
-// The policy never holds or fetches the data key. The caller's pass phrase has the
+// Normally the policy never holds the data key. The caller's pass phrase has the
 // form `<workload GUID>:<passphrase>`, and the policy sends the DataBlind service
 // (the AWS Lambda behind dataCryptService) the GUID part; the service asks
 // datablindcp for the key of that workload's app zone. The GUID therefore selects
@@ -9,7 +9,33 @@
 // app zone). The policy only makes sure the value is a well-formed GUID, and
 // blocks the response when it is not.
 //
-// Nothing here does I/O or logging. Error texts never repeat the pass phrase.
+// Optionally an operator can set the **DataBlind Key** setting. Then that key is
+// sent to the service and used instead, nothing is fetched, and the pass phrase
+// does not need a GUID.
+//
+// Nothing here does I/O or logging. Error texts never repeat the pass phrase or
+// the key.
+
+/// Where the service gets the data key for one request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeySource<'a> {
+    /// The key set on the policy, sent to the service as it was entered.
+    Key(&'a str),
+    /// The workload whose app zone key the service fetches from datablindcp.
+    Workload(&'a str),
+}
+
+/// The configured DataBlind Key if there is one (a value that is empty or only
+/// whitespace counts as not set), otherwise the workload GUID from the pass phrase.
+pub fn key_source<'a>(
+    configured_key: Option<&'a str>,
+    passphrase: &'a str,
+) -> Result<KeySource<'a>, String> {
+    match configured_key {
+        Some(key) if !key.trim().is_empty() => Ok(KeySource::Key(key)),
+        _ => workload_guid_from_passphrase(passphrase).map(KeySource::Workload),
+    }
+}
 
 /// 8-4-4-4-12 hexadecimal digits, either case, and nothing else.
 pub fn is_uuid(s: &str) -> bool {
@@ -61,7 +87,7 @@ mod tests {
             "11111111-2222-4333-8444-555555555555\n",
             "11111111-2222-4333-8444-555555555555:pass",
         ] {
-            assert!(!is_uuid(bad), "{bad:?}");
+            assert!(!is_uuid(bad), "{:?}", bad);
         }
     }
 
@@ -92,7 +118,7 @@ mod tests {
             "not-a-guid:pass".to_string(),
             format!("pass:{GUID}"),                     // GUID in the wrong place
         ] {
-            assert!(workload_guid_from_passphrase(&bad).is_err(), "{bad:?}");
+            assert!(workload_guid_from_passphrase(&bad).is_err(), "{:?}", bad);
         }
     }
 
@@ -101,7 +127,47 @@ mod tests {
         let secret = "hunter2-secret-passphrase";
         for input in [secret.to_string(), format!("{secret}:{secret}")] {
             let message = workload_guid_from_passphrase(&input).unwrap_err();
-            assert!(!message.contains(secret), "{message}");
+            assert!(!message.contains(secret), "{}", message);
         }
+    }
+
+    #[test]
+    fn a_configured_key_wins_and_the_pass_phrase_is_not_needed() {
+        assert_eq!(key_source(Some("k3y"), ""), Ok(KeySource::Key("k3y")));
+        assert_eq!(key_source(Some("k3y"), "no-guid"), Ok(KeySource::Key("k3y")));
+        assert_eq!(
+            key_source(Some("k3y"), &format!("{GUID}:pass")),
+            Ok(KeySource::Key("k3y"))
+        );
+    }
+
+    #[test]
+    fn the_key_is_sent_as_entered() {
+        assert_eq!(key_source(Some(" k3y "), ""), Ok(KeySource::Key(" k3y ")));
+    }
+
+    #[test]
+    fn a_blank_or_missing_key_falls_back_to_the_workload() {
+        let phrase = format!("{GUID}:pass");
+        for key in [None, Some(""), Some("   "), Some("\n")] {
+            assert_eq!(key_source(key, &phrase), Ok(KeySource::Workload(GUID)), "{:?}", key);
+        }
+    }
+
+    #[test]
+    fn without_a_key_a_pass_phrase_without_a_guid_is_refused() {
+        for key in [None, Some(""), Some("  ")] {
+            assert!(key_source(key, "").is_err(), "{:?}", key);
+            assert!(key_source(key, "pass").is_err(), "{:?}", key);
+        }
+    }
+
+    #[test]
+    fn errors_never_repeat_the_key() {
+        let key = "super-secret-key-value";
+        // A key is only ever in the error path if it was ignored, which it is not.
+        assert!(key_source(Some(key), "").is_ok());
+        let message = key_source(Some("  "), key).unwrap_err();
+        assert!(!message.contains(key), "{}", message);
     }
 }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generated::config::Config as GeneratedConfig;
-use crate::workload_guid::workload_guid_from_passphrase;
+use crate::workload_guid::{key_source, KeySource};
 
 // Policy version is sourced from the `version` field in Cargo.toml at compile time
 // (Cargo exposes it as CARGO_PKG_VERSION), so it never needs manual updating here.
@@ -142,12 +142,17 @@ impl DictumSummary {
 
 /// Request body expected by the DataCrypt REST service (see DataCryptApp.RequestBody).
 ///
-/// There is deliberately no `key`: the service fetches the key of the workload's app
-/// zone itself (`workloadGuId`), so the key never passes through the policy.
+/// Exactly one of `key` and `workload_gu_id` is set. With `workload_gu_id` the service
+/// fetches the key of the workload's app zone itself, so the key never passes through
+/// the policy; `key` is only present when the operator set the DataBlind Key setting,
+/// and is never logged.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DataCryptRequest {
-    workload_gu_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workload_gu_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tweak: Option<String>,
     data: Value,
@@ -950,18 +955,20 @@ async fn response_filter(
     let data_crypt_api_key = normalized_api_key(&config.data_crypt_api_key);
     warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
-    // The service fetches the key itself, from the workload GUID the caller put in
-    // front of the pass phrase. Without a well-formed one the response is blocked
-    // rather than sent unprotected or protected under some other key. The pass
-    // phrase itself is never logged.
-    let workload_gu_id: String = match workload_guid_from_passphrase(&credentials.passphrase) {
-        Ok(guid) => guid.to_string(),
-        Err(reason) => {
-            logger::error!("{LOG_LABEL}No usable workload GUID in the pass phrase ({reason}); blocking the response");
-            block_unprotected_response(headers_body_handler);
-            return;
-        }
-    };
+    // Either the key set on the policy, or the workload GUID the caller put in front of
+    // the pass phrase (the service then fetches the key itself). With neither, the
+    // response is blocked rather than sent unprotected or protected under some other
+    // key. Neither the key nor the pass phrase is ever logged.
+    let (data_key, workload_gu_id): (Option<String>, Option<String>) =
+        match key_source(config.data_blind_key.as_deref(), &credentials.passphrase) {
+            Ok(KeySource::Key(key)) => (Some(key.to_string()), None),
+            Ok(KeySource::Workload(guid)) => (None, Some(guid.to_string())),
+            Err(reason) => {
+                logger::error!("{LOG_LABEL}No DataBlind Key is set and the pass phrase has no usable workload GUID ({reason}); blocking the response");
+                block_unprotected_response(headers_body_handler);
+                return;
+            }
+        };
 
     let mut tweak_eval = config.tweak.evaluator();
     tweak_eval.bind_payload(&headers_body_state);
@@ -1008,6 +1015,7 @@ async fn response_filter(
                 .unwrap_or_else(|_| filter_rule.to_string())
         );
         let request = DataCryptRequest {
+            key: data_key.clone(),
             workload_gu_id: workload_gu_id.clone(),
             tweak: None,
             data: datacrypt_data.clone(),
@@ -1070,6 +1078,7 @@ async fn response_filter(
             );
 
             let request = DataCryptRequest {
+                key: data_key.clone(),
                 workload_gu_id: workload_gu_id.clone(),
                 tweak: Some(tweak.clone()),
                 data: datacrypt_data.clone(),
@@ -1117,6 +1126,7 @@ async fn response_filter(
             );
 
             let request = DataCryptRequest {
+                key: data_key.clone(),
                 workload_gu_id: workload_gu_id.clone(),
                 tweak: Some(tweak.clone()),
                 data: datacrypt_data.clone(),
@@ -1226,10 +1236,10 @@ mod datacrypt_response_tests {
         }
     }
 
-    #[test]
-    fn the_request_carries_the_workload_and_never_a_key() {
+    fn request(key: Option<&str>, workload: Option<&str>) -> Value {
         let request = DataCryptRequest {
-            workload_gu_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            key: key.map(str::to_string),
+            workload_gu_id: workload.map(str::to_string),
             tweak: None,
             data: Value::Null,
             sensitive_fields: None,
@@ -1237,11 +1247,24 @@ mod datacrypt_response_tests {
             over_ride_token: String::new(),
             over_ride_pass_phrase: String::new(),
         };
-        let json: Value = serde_json::to_value(&request).unwrap();
+        serde_json::to_value(&request).unwrap()
+    }
+
+    #[test]
+    fn the_request_carries_the_workload_and_no_key_by_default() {
+        let json = request(None, Some("11111111-2222-4333-8444-555555555555"));
         let object = json.as_object().unwrap();
         assert_eq!(object["workloadGuId"], "11111111-2222-4333-8444-555555555555");
         assert!(!object.contains_key("key"));
         assert!(object.contains_key("overRideToken") && object.contains_key("overRidePassPhrase"));
+    }
+
+    #[test]
+    fn a_configured_key_is_sent_without_a_workload() {
+        let json = request(Some("k3y"), None);
+        let object = json.as_object().unwrap();
+        assert_eq!(object["key"], "k3y");
+        assert!(!object.contains_key("workloadGuId"));
     }
 }
 

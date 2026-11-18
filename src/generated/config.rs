@@ -10,6 +10,8 @@ pub struct FilterConditions0Config {
 }
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
+    #[serde(alias = "dataBlindKey")]
+    pub data_blind_key: Option<String>,
     #[serde(
         alias = "dataBlindPassphrase",
         deserialize_with = "de_data_blind_passphrase_0"

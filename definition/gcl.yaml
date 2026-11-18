@@ -98,10 +98,21 @@ spec:
       "@context":
         "@characteristics":
           - security:sensitive
+    dataBlindKey:
+      type: string
+      title: 5. DataBlind Key (optional)
+      description: >-
+        Leave empty to have the DataBlind service fetch the key for the workload GUID at the start
+        of the DataBlind Passphrase. If set, this key is sent to the service and used instead, no
+        key is fetched, and the passphrase does not need a workload GUID. The key is then stored in
+        this policy's configuration.
+      "@context":
+        "@characteristics":
+          - security:sensitive
     tweak:
       type: string
       format: dataweave
-      title: 5. Tweak
+      title: 6. Tweak
       description: Payload Field to be used as Encryption Tweak
       default: "#[payload.Id default '12345678']"
       bindings:
@@ -111,28 +122,28 @@ spec:
     eligibleHttpCodes:
       type: string
       format: dataweave
-      title: 6. Eligible HTTP Codes
+      title: 7. Eligible HTTP Codes
       description: Apply Datablind only when the API response has the following HTTP Codes
       default: "#['200,201,202,205,213']"
     dataBlindToken:
       type: string
       format: dataweave
-      title: 7. DataBlind Token
+      title: 8. DataBlind Token
       description: When a valid override token is provided, Datablind returns the unencrypted and unmasked data
       default: "#[attributes.headers['dataBlindToken']]"
     dataBlindPassphrase:
       type: string
       format: dataweave
-      title: 8. DataBlind Passphrase
+      title: 9. DataBlind Passphrase
       description: >-
-        The caller's pass phrase, in the form <workload GUID>:<passphrase>. The workload GUID selects
-        the DataBlind workload (and so the app zone key) used for the request; a request without one
-        is blocked. When a valid override token and passphrase are provided, Datablind returns the
+        The caller's pass phrase, in the form <workload GUID>:<passphrase>. Unless a DataBlind Key is
+        set, the workload GUID selects the DataBlind workload (and so the app zone key) used for the
+        request, and a request without one is blocked. When a valid override token and passphrase are provided, Datablind returns the
         unencrypted and unmasked data.
       default: "#[attributes.headers['dataBlindPassphrase']]"
     debugLogging:
       type: boolean
-      title: 9. Debug Logging (Request/Response Payloads)
+      title: 10. Debug Logging (Request/Response Payloads)
       description: >-
         Enable in lower environments (e.g. Dev/Test) to log the request and response message
         payloads. Leave disabled in higher environments (e.g. Prod) to avoid logging sensitive data.
