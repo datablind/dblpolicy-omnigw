@@ -38,6 +38,8 @@ pub struct Config {
     pub filter_mode: Option<String>,
     #[serde(alias = "filterOperator")]
     pub filter_operator: Option<String>,
+    #[serde(alias = "keyMode")]
+    pub key_mode: Option<String>,
     #[serde(alias = "sensitiveFieldsMultiLine")]
     pub sensitive_fields_multi_line: Option<String>,
     #[serde(alias = "tweak", deserialize_with = "de_tweak_3")]

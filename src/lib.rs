@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generated::config::Config as GeneratedConfig;
-use crate::workload_guid::{key_source, KeySource};
+use crate::workload_guid::{key_source, resolve_key_mode, KeyMode, KeySource};
 
 // Policy version is sourced from the `version` field in Cargo.toml at compile time
 // (Cargo exposes it as CARGO_PKG_VERSION), so it never needs manual updating here.
@@ -50,6 +50,7 @@ struct ConfigCompatibility {
 struct RuntimeConfig {
     inner: GeneratedConfig,
     encrypt_mode: EncryptMode,
+    key_mode: KeyMode,
 }
 
 impl RuntimeConfig {
@@ -60,6 +61,7 @@ impl RuntimeConfig {
             .map_err(|err| config_parse_error("configuration compatibility", &err))?;
 
         Ok(Self {
+            key_mode: resolve_key_mode(inner.key_mode.as_deref(), inner.data_blind_key.as_deref()),
             encrypt_mode: resolve_encrypt_mode(
                 inner.encrypt_mode.as_deref(),
                 compatibility.sensitive_fields_specified,
@@ -142,9 +144,9 @@ impl DictumSummary {
 
 /// Request body expected by the DataCrypt REST service (see DataCryptApp.RequestBody).
 ///
-/// Exactly one of `key` and `workload_gu_id` is set. With `workload_gu_id` the service
+/// Exactly one of `key` and `workload_id` is set. With `workload_id` the service
 /// fetches the key of the workload's app zone itself, so the key never passes through
-/// the policy; `key` is only present when the operator set the DataBlind Key setting,
+/// the policy; `key` is only present when the operator chose Provide DataBlind Key,
 /// and is never logged.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -152,7 +154,7 @@ struct DataCryptRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    workload_gu_id: Option<String>,
+    workload_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tweak: Option<String>,
     data: Value,
@@ -955,16 +957,16 @@ async fn response_filter(
     let data_crypt_api_key = normalized_api_key(&config.data_crypt_api_key);
     warn_if_api_key_missing("dataCryptApiKey", data_crypt_api_key.as_deref());
 
-    // Either the key set on the policy, or the workload GUID the caller put in front of
-    // the pass phrase (the service then fetches the key itself). With neither, the
-    // response is blocked rather than sent unprotected or protected under some other
-    // key. Neither the key nor the pass phrase is ever logged.
-    let (data_key, workload_gu_id): (Option<String>, Option<String>) =
-        match key_source(config.data_blind_key.as_deref(), &credentials.passphrase) {
+    // Either the key set on the policy, or the workload GUID in the caller's override
+    // token (the service then fetches the key itself). With neither, the response is
+    // blocked rather than sent unprotected or protected under some other key. Neither
+    // the key, the token nor the pass phrase is ever logged.
+    let (data_key, workload_id): (Option<String>, Option<String>) =
+        match key_source(config.key_mode, config.data_blind_key.as_deref(), &credentials.token) {
             Ok(KeySource::Key(key)) => (Some(key.to_string()), None),
             Ok(KeySource::Workload(guid)) => (None, Some(guid.to_string())),
             Err(reason) => {
-                logger::error!("{LOG_LABEL}No DataBlind Key is set and the pass phrase has no usable workload GUID ({reason}); blocking the response");
+                logger::error!("{LOG_LABEL}No DataBlind Key can be used: {reason}; blocking the response");
                 block_unprotected_response(headers_body_handler);
                 return;
             }
@@ -1016,7 +1018,7 @@ async fn response_filter(
         );
         let request = DataCryptRequest {
             key: data_key.clone(),
-            workload_gu_id: workload_gu_id.clone(),
+            workload_id: workload_id.clone(),
             tweak: None,
             data: datacrypt_data.clone(),
             sensitive_fields: None,
@@ -1079,7 +1081,7 @@ async fn response_filter(
 
             let request = DataCryptRequest {
                 key: data_key.clone(),
-                workload_gu_id: workload_gu_id.clone(),
+                workload_id: workload_id.clone(),
                 tweak: Some(tweak.clone()),
                 data: datacrypt_data.clone(),
                 sensitive_fields,
@@ -1127,7 +1129,7 @@ async fn response_filter(
 
             let request = DataCryptRequest {
                 key: data_key.clone(),
-                workload_gu_id: workload_gu_id.clone(),
+                workload_id: workload_id.clone(),
                 tweak: Some(tweak.clone()),
                 data: datacrypt_data.clone(),
                 sensitive_fields: None,
@@ -1239,7 +1241,7 @@ mod datacrypt_response_tests {
     fn request(key: Option<&str>, workload: Option<&str>) -> Value {
         let request = DataCryptRequest {
             key: key.map(str::to_string),
-            workload_gu_id: workload.map(str::to_string),
+            workload_id: workload.map(str::to_string),
             tweak: None,
             data: Value::Null,
             sensitive_fields: None,
@@ -1254,7 +1256,8 @@ mod datacrypt_response_tests {
     fn the_request_carries_the_workload_and_no_key_by_default() {
         let json = request(None, Some("11111111-2222-4333-8444-555555555555"));
         let object = json.as_object().unwrap();
-        assert_eq!(object["workloadGuId"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(object["workloadId"], "11111111-2222-4333-8444-555555555555");
+        assert!(!object.contains_key("workloadGuId"));
         assert!(!object.contains_key("key"));
         assert!(object.contains_key("overRideToken") && object.contains_key("overRidePassPhrase"));
     }
@@ -1264,7 +1267,7 @@ mod datacrypt_response_tests {
         let json = request(Some("k3y"), None);
         let object = json.as_object().unwrap();
         assert_eq!(object["key"], "k3y");
-        assert!(!object.contains_key("workloadGuId"));
+        assert!(!object.contains_key("workloadId"));
     }
 }
 

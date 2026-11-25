@@ -10,7 +10,7 @@
 
 **Tech Stack:** Rust (edition 2018, `wasm32-wasip1`), Anypoint PDK 1.9.0 (`pdk::cache`, `Clock`, `HttpClient`), serde/serde_json, `pdk-test` + `httpmock` for the integration test.
 
-**Spec:** `/Users/kanishkaranr/ZTensor/projects/datablindcp/docs/superpowers/specs/2026-11-09-datablind-workloads-key-resolution-design.md`. The server side is `/Users/kanishkaranr/ZTensor/projects/datablindcp/docs/superpowers/plans/2026-11-09-datablind-workloads-key-resolution.md` (Task 3 must be deployed first).
+**Spec:** `~/ZTensor/projects/datablindcp/docs/superpowers/specs/2026-11-09-datablind-workloads-key-resolution-design.md`. The server side is `~/ZTensor/projects/datablindcp/docs/superpowers/plans/2026-11-09-datablind-workloads-key-resolution.md` (Task 3 must be deployed first).
 
 ## Global Constraints
 
@@ -103,7 +103,7 @@
   enum KeySource { Legacy, Resolved { key_id: String } }
   async fn resolve_key(client: &HttpClient, service: &Service, access_key: &str, req: &ResolveRequest<'_>) -> Result<ResolveResponse, ResolveFailure>;
   ```
-  `configure` builds `cache_builder.new("datablind-key".to_string()).max_entries(8).build()` and obtains `Clock` the same way `/Users/kanishkaranr/ZTensor/projects/zt-auth-policy-omni/src/lib.rs` does; passes both into the filters.
+  `configure` builds `cache_builder.new("datablind-key".to_string()).max_entries(8).build()` and obtains `Clock` the same way `~/ZTensor/projects/zt-auth-policy-omni/src/lib.rs` does; passes both into the filters.
 
 - [ ] **Step 1: Write failing unit tests** for the decision logic that does not need a gateway (put it in `key_resolution.rs` as `pub fn plan(source_cached: Option<String>, outcome: Result<ResolveResponse, ResolveFailure>, caller: &Credentials) -> Plan` with `enum Plan { Use{key: String, creds: Credentials, cache_it: bool}, Block }`), tests: `fresh_ok_uses_caller_creds_and_caches_key`, `fresh_workload_not_ok_blanks_creds_and_caches_key`, `rejected_with_cached_key_uses_cached_key_blank_creds`, `rejected_without_cache_blocks`, `malformed_without_cache_blocks`, `transport_error_with_cache_blank_creds`, `no_call_needed_and_cached_key_uses_cache_with_caller_creds_blank` (a request without override credentials needs only the key; caller creds are empty anyway).
 - [ ] **Step 2: Run** `cargo test --lib key_resolution::plan` -> FAIL.

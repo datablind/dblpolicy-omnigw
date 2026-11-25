@@ -98,14 +98,22 @@ spec:
       "@context":
         "@characteristics":
           - security:sensitive
+    keyMode:
+      type: string
+      title: 5. DataBlind Key
+      description: Where the DataBlind Key comes from
+      enum:
+        - None (requires a workload to fetch the DataBlind Key)
+        - Provide DataBlind Key
+      default: None (requires a workload to fetch the DataBlind Key)
     dataBlindKey:
       type: string
-      title: 5. DataBlind Key (optional)
-      description: >-
-        Leave empty to have the DataBlind service fetch the key for the workload GUID at the start
-        of the DataBlind Passphrase. If set, this key is sent to the service and used instead, no
-        key is fetched, and the passphrase does not need a workload GUID. The key is then stored in
-        this policy's configuration.
+      title: DataBlind Key
+      description: Used for every request. Stored in this policy's configuration.
+      "@rendering":
+        "@visibleOn":
+          - property: keyMode
+            value: Provide DataBlind Key
       "@context":
         "@characteristics":
           - security:sensitive
@@ -129,17 +137,19 @@ spec:
       type: string
       format: dataweave
       title: 8. DataBlind Token
-      description: When a valid override token is provided, Datablind returns the unencrypted and unmasked data
+      description: >-
+        When a valid override token is provided, Datablind returns the unencrypted and unmasked
+        data. The token also names the DataBlind workload it was created for: unless Provide DataBlind
+        Key is chosen in 5, a request whose token names no workload is blocked.
       default: "#[attributes.headers['dataBlindToken']]"
     dataBlindPassphrase:
       type: string
       format: dataweave
       title: 9. DataBlind Passphrase
       description: >-
-        The caller's pass phrase, in the form <workload GUID>:<passphrase>. Unless a DataBlind Key is
-        set, the workload GUID selects the DataBlind workload (and so the app zone key) used for the
-        request, and a request without one is blocked. When a valid override token and passphrase are provided, Datablind returns the
-        unencrypted and unmasked data.
+        The caller's pass phrase, exactly as it was chosen when the override token was created. It
+        does not contain a workload. When a valid override token and passphrase are provided,
+        Datablind returns the unencrypted and unmasked data.
       default: "#[attributes.headers['dataBlindPassphrase']]"
     debugLogging:
       type: boolean
